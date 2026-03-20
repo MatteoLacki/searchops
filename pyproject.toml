@@ -3,44 +3,33 @@ requires = ["setuptools >= 64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name="searchops"
-version="0.0.1"
-description="SHORT DESC."
-readme="README.md"
-authors=[
-    {name="MatteoLacki",email="matteo.lacki@gmail.com"},
+name = "searchops"
+version = "0.1.0"
+description = "Tools for parsing and summarizing proteomics search engine results."
+readme = "README.md"
+authors = [
+    {name = "MatteoLacki", email = "matteo.lacki@gmail.com"},
 ]
-requires-python = ">=3.6"
-# dependencies = [
-#     "click",
-# ]
-
-# [project.optional-dependencies]
-# dev = [
-#     "twine",
-#     "pytest",
-# ]
-
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb",
+    "pandas",
+    "tqdm",
+]
 
 [project.scripts]
-example_shell_script = "searchops.cli.example_shell_script:example_shell_script"
+sage-summary  = "searchops.cli.sage_summary:main"
+sage-write    = "searchops.cli.sage_write:main"
+tsv2parquet    = "searchops.cli.tsv2parquet:main"
+sage-filter    = "searchops.cli.sage_filter:main"
+sage-summarize = "searchops.cli.sage_summarize:main"
 
 [project.urls]
-homepage="https://github.com/MatteoLacki/searchops.git"
-repository="https://github.com/MatteoLacki/searchops.git"
+homepage   = "https://github.com/MatteoLacki/searchops.git"
+repository = "https://github.com/MatteoLacki/searchops.git"
 
 [tool.uv]
 reinstall-package = ["searchops"]
 
-# [tool.pytest.ini_options]
-# testpaths = ["tests"]
-
-
 [tool.setuptools.packages.find]
 where = ["src"]
-
-# [tool.setuptools]
-# include-package-data = true
-
-# [tool.setuptools.package-data]
-# searchops = ["data/*.csv"]
