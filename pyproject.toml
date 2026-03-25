@@ -15,6 +15,10 @@ dependencies = [
     "duckdb",
     "pandas",
     "tqdm",
+    "numba",
+    "numpy",
+    "numba_progress",
+    "timstofu",
 ]
 
 [project.scripts]
@@ -22,7 +26,8 @@ sage-summary  = "searchops.cli.sage_summary:main"
 sage-write    = "searchops.cli.sage_write:main"
 tsv2parquet    = "searchops.cli.tsv2parquet:main"
 sage-filter    = "searchops.cli.sage_filter:main"
-sage-summarize = "searchops.cli.sage_summarize:main"
+sage-summarize     = "searchops.cli.sage_summarize:main"
+sage-pmsms-mapper  = "searchops.cli.sage_pmsms_mapper:main"
 
 [project.urls]
 homepage   = "https://github.com/MatteoLacki/searchops.git"
