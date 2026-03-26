@@ -11,7 +11,8 @@ src/searchops/
     ├── sage_filter.py       # sage-filter   — FDR-filter TSV/parquet → parquet
     ├── tsv2parquet.py       # tsv2parquet   — convert SAGE TSV → parquet
     ├── sage_summarize.py    # sage-summarize — count pre-filtered parquet
-    └── sage_pmsms_mapper.py # sage-pmsms-mapper — map fragments to mmappet library
+    ├── sage_pmsms_mapper.py # sage-pmsms-mapper — map fragments to mmappet library
+    └── sage_score_mapper.py # sage_score_mapper — visualise pmsms score distributions
 ```
 
 ## Core API (`sage.py`)
@@ -70,6 +71,29 @@ Numba dispatch.
 - Unsubmitted `precursor_idx` raise an error
 
 **Key dependencies**: `numba`, `timstofu`, mmappet dataset.
+
+## `sage_score_mapper` — pmsms score visualisation
+
+Compares the `score` column of the pmsms mmappet library between fragments matched
+back by SAGE and all remaining (unmatched) fragments.
+
+**Inputs**:
+- Filtered precursor candidates parquet
+- `pmsms.mmappet` directory (columns used: `score`, `intensity`)
+- `sage_mapped_to_pmsms/precursors.parquet` — CSR index (`mapped_idx`, `mapped_cnt`, `detected_charges`) from `sage-pmsms-mapper`
+- `sage_mapped_to_pmsms/mapping.parquet` — `pmsms_fragment_idx` per matched fragment
+- Pipeline config TOML — reads `pseudomsms.tofs_extraction_method` and `tofs_extraction_params` for plot titles
+
+**Outputs** (written to `--output` directory):
+- `score_distribution.png` — 1D density histogram: matched vs unmatched overlay (matplotlib)
+- `score_by_charge.png` — per-charge faceted histograms with unmatched reference in every panel (plotnine)
+- `score_vs_intensity_2d.png` — side-by-side 2D heatmaps of `score` vs `log10(1+intensity)`, normalised to density (kilograms + matplotlib)
+- `score_vs_intensity_isoquants.png` — Gaussian-smoothed isoquant overlay of both distributions on a dark background (matplotlib contour)
+
+**Score label**: when `tofs_extraction_method == "score"`, the title summarises all
+`tofs_extraction_params` key=value pairs wrapped at 80 characters.
+
+**Key dependencies**: `mmappet`, `kilograms`, `plotnine`, `scipy.ndimage`.
 
 ## Adding a new CLI tool
 

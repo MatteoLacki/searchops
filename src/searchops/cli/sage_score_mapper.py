@@ -3,10 +3,15 @@ import textwrap
 import tomllib
 from pathlib import Path
 
+import plotnine as P
 import mmappet
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import kilograms as kg
+
+from matplotlib.lines import Line2D
+from scipy.ndimage import gaussian_filter
 
 
 def main():
@@ -26,6 +31,16 @@ def main():
 
 
 if __name__ == "__main__":
+    try:
+        in_ipython = get_ipython() is not None  # type: ignore[name-defined]
+    except NameError:
+        in_ipython = False
+    if in_ipython:
+        plt.show()
+    else:
+        fig.savefig(output / "score_distribution.png", dpi=150)
+        plt.close(fig)
+
     from pprint import pprint
 
     dataset = "F9477"
@@ -70,9 +85,11 @@ def compare_scores(
     else:
         score_label = score_method
 
-    pmsms_score = mmappet.open_dataset_dct(pmsms)["score"]
+    pmsms_data = mmappet.open_dataset_dct(pmsms)
+    pmsms_score = pmsms_data["score"]
+    pmsms_intensity = pmsms_data["intensity"]
     mapping_df = pd.read_parquet(mapping)
-    mapped_prec_df = pd.read_parquet(mapped_precursors)  # noqa: F841  reserved
+    mapped_prec_df = pd.read_parquet(mapped_precursors)
 
     # ── 2. Extract pmsms scores for matched fragments ─────────────────────────
     matched_idx = mapping_df["pmsms_fragment_idx"].to_numpy()
@@ -95,21 +112,159 @@ def compare_scores(
     n_unmatched = int(unmatched_counts.sum())
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.stairs(_density(matched_counts), edges, fill=True, alpha=0.5,
-              label=f"matched ({n_matched:_})")
-    ax.stairs(_density(unmatched_counts), edges, fill=True, alpha=0.5,
-              label=f"unmatched ({n_unmatched:_})")
+    ax.stairs(
+        _density(matched_counts),
+        edges,
+        fill=True,
+        alpha=0.5,
+        label=f"matched ({n_matched:_})",
+    )
+    ax.stairs(
+        _density(unmatched_counts),
+        edges,
+        fill=True,
+        alpha=0.5,
+        label=f"unmatched ({n_unmatched:_})",
+    )
     ax.legend()
     ax.set_xlabel("pmsms score")
     ax.set_ylabel("density")
-    ax.set_title(f"{score_label}\n({n_matched:_} matched / {n_unmatched:_} unmatched)", fontsize=9)
+    ax.set_title(
+        f"{score_label}\n({n_matched:_} matched / {n_unmatched:_} unmatched)",
+        fontsize=9,
+    )
     fig.tight_layout()
-    try:
-        in_ipython = get_ipython() is not None  # type: ignore[name-defined]
-    except NameError:
-        in_ipython = False
+
+    # ── 4. per-charge conditional histograms ────────────────────────
+
+    # charge label per matched fragment via CSR expansion
+    charge_per_fragment = np.repeat(
+        mapped_prec_df["detected_charges"].to_numpy(),
+        mapped_prec_df["mapped_cnt"].to_numpy(),
+    )
+    matched_plot_df = pd.DataFrame(
+        {
+            "score": matched_scores,
+            "charge": charge_per_fragment.astype(str),
+        }
+    )
+
+    # Reconstruct an unmatched reference sample from the pre-computed histogram
+    # (avoids materialising a ~187M array).  No 'charge' column → appears in all facets.
+    bin_centers = (edges[:-1] + edges[1:]) / 2
+    rng = np.random.default_rng(0)
+    unmatched_sample = rng.choice(
+        bin_centers,
+        size=min(200_000, n_unmatched),
+        p=unmatched_counts / unmatched_counts.sum(),
+    )
+    unmatched_plot_df = pd.DataFrame({"score": unmatched_sample})
+
+    p = (
+        P.ggplot(matched_plot_df, P.aes("score"))
+        + P.geom_histogram(
+            P.aes(y=P.after_stat("density")), bins=50, fill="steelblue", alpha=0.6
+        )
+        + P.geom_histogram(
+            unmatched_plot_df,
+            P.aes("score", y=P.after_stat("density")),
+            bins=50,
+            fill="#808080",
+            alpha=0.4,
+        )
+        + P.facet_wrap("~charge")
+        + P.labs(
+            x="pmsms score",
+            y="density",
+            title=f"{score_label}\nblue=matched by charge, grey=unmatched (all facets)",
+        )
+        + P.theme_bw()
+        + P.theme(plot_title=P.element_text(size=7))
+    )
+    if in_ipython:
+        p.show()
+    else:
+        p.save(
+            output / "score_by_charge.png", dpi=150, verbose=False, width=14, height=6
+        )
+
+    # ── 5. score vs log10(intensity), matched vs unmatched ──────
+
+    log10_int_all = np.log10(1 + pmsms_intensity.astype(np.float32))
+    log10_int_matched = log10_int_all[matched_idx]
+
+    extent = (
+        (float(pmsms_score.min()), float(pmsms_score.max())),
+        (float(log10_int_all.min()), float(log10_int_all.max())),
+    )
+    bins = 200
+
+    bins_2d = (bins, bins)
+    h_all = kg.histogram2D(pmsms_score, log10_int_all, extent=extent, bins=bins_2d)
+    h_matched = kg.histogram2D(
+        matched_scores, log10_int_matched, extent=extent, bins=bins_2d
+    )
+    h_unmatched = h_all - h_matched
+
+    def _norm2d(h):
+        return h / h.sum()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True, sharey=True)
+    imshow_kw = dict(
+        origin="lower",
+        aspect="auto",
+        cmap="inferno",
+        extent=[extent[0][0], extent[0][1], extent[1][0], extent[1][1]],
+    )
+    for ax, h, label in zip(axes, [h_matched, h_unmatched], ["matched", "unmatched"]):
+        ax.imshow(_norm2d(h).T, **imshow_kw)
+        ax.set_xlabel("pmsms score")
+        ax.set_ylabel("log10(intensity)")
+        ax.set_title(label)
+    fig.suptitle(score_label, fontsize=9)
+    fig.tight_layout()
     if in_ipython:
         plt.show()
     else:
-        fig.savefig(output / "score_distribution.png", dpi=150)
+        fig.savefig(output / "score_vs_intensity_2d.png", dpi=150)
+        plt.close(fig)
+
+    # ── 6. Isoquant overlay ───────────────────────────────────────────────────
+
+    x_centers = np.linspace(extent[0][0], extent[0][1], bins)
+    y_centers = np.linspace(extent[1][0], extent[1][1], bins)
+
+    def _smooth(h, sigma=2.0):
+        return gaussian_filter(_norm2d(h).astype(np.float64), sigma=sigma)
+
+    with plt.style.context("dark_background"):
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        levels = 10
+        ax.contour(
+            x_centers,
+            y_centers,
+            _smooth(h_matched).T,
+            levels=levels,
+            colors="steelblue",
+        )
+        ax.contour(
+            x_centers,
+            y_centers,
+            _smooth(h_unmatched).T,
+            levels=levels,
+            colors="darkorange",
+        )
+        ax.legend(
+            [Line2D([0], [0], color="steelblue"), Line2D([0], [0], color="darkorange")],
+            ["matched", "unmatched"],
+        )
+        ax.set_xlabel("pmsms score")
+        ax.set_ylabel("log10(intensity)")
+        ax.set_title(score_label, fontsize=9)
+        fig.tight_layout()
+    if in_ipython:
+        plt.show()
+    else:
+        fig.savefig(output / "score_vs_intensity_isoquants.png", dpi=150)
         plt.close(fig)
