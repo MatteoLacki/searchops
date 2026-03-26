@@ -8,8 +8,14 @@ Mapping chain:
     → binary-search nearest-neighbour match on fragment_mz_experimental
     → pmsms_fragment_idx per sage matched fragment
 
-Output: mmappet with data (pmsms_fragment_idx, mz_delta, fragment_row_idx) and
-index (precursor_idx, start, count) — one data row per matched fragment.
+Output: directory with three parquet files:
+  precursors.parquet       — one row per matched precursor
+                             (precursor_idx, detected_charges, submitted_charges,
+                              mapped_idx, mapped_cnt)
+  mapping.parquet          — one row per matched fragment within mz_err_tol
+                             (pmsms_fragment_idx, sage_fragment_idx)
+  mz_delta_quantiles.parquet — 101-point quantile distribution of mz_delta
+                             (quantile, mz_delta)
 
 Runtime dependencies (assumed present in venvs/common):
   mmappet, duckdb, numba, numba_progress, numpy, pandas
@@ -145,6 +151,7 @@ if __name__ == "__main__":
     from pprint import pprint
 
     dataset = "F9477"
+    dataset = "F9468"
     cfg = "optimal2tier"
     sage_version = "devel"
     sage_cfg = "p12f15"
@@ -157,6 +164,7 @@ if __name__ == "__main__":
         output=f"/home/matteo/temp/{dataset}_{cfg}_mappedback",
         verbose=True,
         use_duckdb=True,
+        mz_err_tol=0.001,
     )
     pprint(__args)
     locals().update(**__args)
@@ -168,13 +176,13 @@ def map_sage_to_pmsms(
     precursors_parquet: Path,
     pmsms_dir: Path,
     output: Path,
+    mz_err_tol: float = 0.001,
     verbose: bool = True,
     use_duckdb: bool = True,
 ) -> None:
     """Map sage FDR-filtered PSMs and matched fragments to pmsms.mmappet entries.
 
-    Writes mmappet data (pmsms_fragment_idx, mz_delta, fragment_row_idx) and
-    index (precursor_idx, start, count), one data row per matched fragment.
+    Writes a directory containing three parquet files (see module docstring).
     """
     # ── 1. Load pmsms_mz (only column needed for matching) ───────────────────
     if verbose:
@@ -188,10 +196,15 @@ def map_sage_to_pmsms(
         print("Loading sage PSMs and matched fragments...")
 
     if use_duckdb:
-        psm_counts = duckdb.sql(
+        # One row per matched fragment, sorted by precursor_idx, with original
+        # file row index preserved for back-referencing the TSV after reordering.
+        merged = duckdb.sql(
             f"""
             WITH raw AS (
-                SELECT psm_id
+                SELECT
+                    row_number() OVER () - 1          AS sage_fragment_idx,
+                    psm_id,
+                    fragment_mz_experimental
                 FROM read_csv('{matched_fragments}', sep='\\t', header=true)
             ),
             psm_map AS (
@@ -205,41 +218,27 @@ def map_sage_to_pmsms(
                 SELECT precursor_idx, fragment_spectrum_start, fragment_event_cnt, charges
                 FROM read_parquet('{precursors_parquet}')
                 WHERE fragment_event_cnt > 0
-            ),
-            merged AS (
-                SELECT m.precursor_idx, m.charge, p.charges,
-                       p.fragment_spectrum_start, p.fragment_event_cnt
-                FROM raw r
-                JOIN psm_map m USING (psm_id)
-                LEFT JOIN prec p ON m.precursor_idx = p.precursor_idx
             )
             SELECT
-                precursor_idx,
-                CAST(array_to_string(list_sort(list(DISTINCT CAST(charge AS VARCHAR))), '') AS BIGINT) AS found_charges,
-                first(charges)                   AS charges,
-                count(*)                         AS cnt,
-                first(fragment_spectrum_start)   AS fragment_spectrum_start,
-                first(fragment_event_cnt)        AS fragment_event_cnt
-            FROM merged
-            GROUP BY precursor_idx
-            ORDER BY precursor_idx
+                m.precursor_idx, m.charge,
+                p.charges, p.fragment_spectrum_start, p.fragment_event_cnt,
+                r.fragment_mz_experimental, r.sage_fragment_idx
+            FROM raw r
+            JOIN psm_map m USING (psm_id)
+            LEFT JOIN prec p ON m.precursor_idx = p.precursor_idx
+            ORDER BY m.precursor_idx
             """
         ).df()
-        unsubmitted_mask = psm_counts["charges"].isna()
-        if unsubmitted_mask.any():
-            bad_idx = psm_counts.loc[unsubmitted_mask, "precursor_idx"].tolist()
-            raise AssertionError(
-                f"\n\n💀 CATASTROPHIC PIPELINE INTEGRITY FAILURE 💀\n"
-                f"SAGE returned {len(bad_idx):_} precursor_idx value(s) that do not exist in the "
-                f"submitted precursors parquet.\n"
-                f"The MGF was likely regenerated without rerunning SAGE. Fix it.\n\n"
-                f"Offending precursor_idx: {sorted(bad_idx)[:20]}"
-            )
     else:
-        # Much slower, for debugging...
-        # psm_id per matched fragment row (file order preserved for exp_mz_arr alignment)
+        # per matched fragment with original file row index
         raw = duckdb.sql(
-            f"SELECT psm_id FROM read_csv('{matched_fragments}', sep='\\t', header=true)"
+            f"""
+            SELECT
+                row_number() OVER () - 1  AS sage_fragment_idx,
+                psm_id,
+                fragment_mz_experimental
+            FROM read_csv('{matched_fragments}', sep='\\t', header=true)
+            """
         ).df()
 
         # precursor_idx and charge extracted from scannr (one row per PSM)
@@ -264,42 +263,55 @@ def map_sage_to_pmsms(
 
         # one row per matched fragment, with precursor info attached.
         # Left join so unsubmitted precursor_idx values are not silently dropped.
-        merged = raw.merge(psm_map, on="psm_id").merge(
-            prec, on="precursor_idx", how="left"
-        )[
-            [
-                "precursor_idx",
-                "charge",
-                "charges",
-                "fragment_spectrum_start",
-                "fragment_event_cnt",
-            ]
-        ]
-        unsubmitted = merged[merged["charges"].isna()]["precursor_idx"].unique()
-        if len(unsubmitted):
-            raise AssertionError(
-                f"\n\n💀 CATASTROPHIC PIPELINE INTEGRITY FAILURE 💀\n"
-                f"SAGE returned {len(unsubmitted):_} precursor_idx value(s) that do not exist in the "
-                f"submitted precursors parquet.\n"
-                f"The MGF was likely regenerated without rerunning SAGE. Fix it.\n\n"
-                f"Offending precursor_idx: {sorted(unsubmitted)[:20]}"
-            )
-
-        # aggregate to one row per precursor_idx
-        psm_counts = (
-            merged.groupby("precursor_idx", sort=True)
-            .agg(
-                found_charges=(
+        merged = (
+            raw.merge(psm_map, on="psm_id")
+            .merge(prec, on="precursor_idx", how="left")[
+                [
+                    "precursor_idx",
                     "charge",
-                    lambda x: int("".join(str(c) for c in sorted(x.unique()))),
-                ),
-                charges=("charges", "first"),
-                cnt=("charge", "count"),
-                fragment_spectrum_start=("fragment_spectrum_start", "first"),
-                fragment_event_cnt=("fragment_event_cnt", "first"),
-            )
-            .reset_index()
+                    "charges",
+                    "fragment_spectrum_start",
+                    "fragment_event_cnt",
+                    "fragment_mz_experimental",
+                    "sage_fragment_idx",
+                ]
+            ]
+            .sort_values("precursor_idx")
+            .reset_index(drop=True)
         )
+
+    # Check for unsubmitted precursor_idx (left-join NULLs → NaN in charges).
+    unsubmitted = merged.loc[merged["charges"].isna(), "precursor_idx"].unique()
+    if len(unsubmitted):
+        raise AssertionError(
+            f"\n\n💀 CATASTROPHIC PIPELINE INTEGRITY FAILURE 💀\n"
+            f"SAGE returned {len(unsubmitted):_} precursor_idx value(s) that do not exist in the "
+            f"submitted precursors parquet.\n"
+            f"The MGF was likely regenerated without rerunning SAGE. Fix it.\n\n"
+            f"Offending precursor_idx: {sorted(unsubmitted)[:20]}"
+        )
+
+    # exp_mz_arr and sage_fragment_idx_arr come from merged (already sorted by precursor_idx)
+    # so their order is guaranteed to match psm_counts below.
+    exp_mz_arr = merged["fragment_mz_experimental"].to_numpy(dtype=np.float32)
+
+    sage_fragment_idx_arr = merged["sage_fragment_idx"].to_numpy(dtype=np.int64)
+
+    # aggregate to one row per precursor_idx (merged is sorted so ORDER BY preserves order)
+    psm_counts = duckdb.sql(
+        """
+        SELECT
+            precursor_idx,
+            CAST(array_to_string(list_sort(list(DISTINCT CAST(charge AS VARCHAR))), '') AS BIGINT) AS found_charges,
+            first(charges)                  AS charges,
+            count(*)                        AS cnt,
+            first(fragment_spectrum_start)  AS fragment_spectrum_start,
+            first(fragment_event_cnt)       AS fragment_event_cnt
+        FROM merged
+        GROUP BY precursor_idx
+        ORDER BY precursor_idx
+    """
+    ).df()
     if verbose:
         print(f"  {len(psm_counts):_} filtered PSMs")
 
@@ -331,18 +343,11 @@ def map_sage_to_pmsms(
             f"{bad.to_string(index=False)}"
         )
 
-    # mz values in file order.
-    exp_mz_arr = (
-        duckdb.sql(
-            f"SELECT fragment_mz_experimental FROM read_csv('{matched_fragments}', sep='\\t', header=true)"
-        )
-        .df()["fragment_mz_experimental"]
-        .to_numpy(dtype=np.float32)
-    )
-
+    # THIS ONLY WORKS BECAUSE ALL OF THE FOUND PRECURSORS ARE A STRICT SUBSET OF SUBMITTED ONES.
     # CSR index: group k covers rows [group_idx[k], group_idx[k+1])
     psm_idx = get_index(psm_counts.cnt.to_numpy())
 
+    # THIS ONLY WORKS BECAUSE ALL OF THE FOUND PRECURSORS ARE A STRICT SUBSET OF SUBMITTED ONES.
     # Sort within each PSM group if not already sorted.
     _sort_exp_mz_groups(exp_mz_arr, psm_idx)
 
@@ -364,46 +369,96 @@ def map_sage_to_pmsms(
             progress=progress,
         )
 
-    matched = pmsms_fragment_idx != -1
-    skipped = len(pmsms_fragment_idx) - matched.sum()
+    nn_matched = pmsms_fragment_idx != -1
+    skipped = len(pmsms_fragment_idx) - nn_matched.sum()
     if skipped and verbose:
         print(
-            f"  WARNING: {skipped:_} / {len(pmsms_fragment_idx):_} = { skipped / len(pmsms_fragment_idx) * 100:.2f}% rows not matched (out-of-range precursor or empty slice)"
+            f"  WARNING: {skipped:_} / {len(pmsms_fragment_idx):_} = {skipped / len(pmsms_fragment_idx) * 100:.2f}% rows not matched (out-of-range precursor or empty slice)"
         )
 
-    # ── 4. Write CSR-style mmappet output ────────────────────────────────────
+    # ── 4. Apply mz tolerance filter ─────────────────────────────────────────
+    matched_frag_idx = pmsms_fragment_idx[nn_matched]
+    mz_delta = pmsms_mz[matched_frag_idx] - exp_mz_arr[nn_matched]
+    within_tol = np.abs(mz_delta) <= mz_err_tol
+
     if verbose:
+        print(
+            f"  {within_tol.sum():_} / {nn_matched.sum():_} = {within_tol.sum() / nn_matched.sum():.2f}% fragments within mz_err_tol={mz_err_tol}"
+        )
         print(f"Writing to {output} ...")
 
-    matched_frag_idx = pmsms_fragment_idx[matched]
-    mz_delta = pmsms_mz[matched_frag_idx] - exp_mz_arr[matched]
+    # ── 5. Build output tables ────────────────────────────────────────────────
+    # bool mask over all merged rows: survived both nn_matched and within_tol
+    keep_mask = nn_matched.copy()
+    keep_mask[nn_matched] &= within_tol
 
-    # data arrays — one entry per matched fragment
-    data = pd.DataFrame(
+    # mapping table: one row per fragment that passed both filters
+    mapping_df = pd.DataFrame(
         {
-            "pmsms_fragment_idx": matched_frag_idx,
-            "mz_delta": mz_delta,
-            "fragment_row_idx": np.where(matched)[0].astype(np.int64),
+            "pmsms_fragment_idx": matched_frag_idx[within_tol],
+            "sage_fragment_idx": sage_fragment_idx_arr[nn_matched][within_tol],
         },
         copy=False,
     )
-    # index — one entry per precursor: where its fragments start and how many
-    index = pd.DataFrame(
+
+    # precursors table: recount per precursor after tolerance filtering
+    # (keep_mask preserves precursor_idx sort order from merged)
+    pids = merged["precursor_idx"].to_numpy()[keep_mask]  # sorted
+    unique_pids, mapped_cnts = np.unique(pids, return_counts=True)
+    mapped_idxs = np.empty(len(mapped_cnts), dtype=np.int64)
+    mapped_idxs[0] = 0
+    mapped_idxs[1:] = np.cumsum(mapped_cnts[:-1])
+
+    pid_df = pd.DataFrame(
         {
-            "precursor_idx": psm_counts["precursor_idx"].to_numpy(dtype=np.int64),
-            "start": psm_idx[:-1],
-            "count": np.diff(psm_idx),
+            "precursor_idx": unique_pids,
+            "mapped_idx": mapped_idxs,
+            "mapped_cnt": mapped_cnts,
+        }
+    )
+    precursors_df = duckdb.sql(
+        """
+        SELECT
+            t.precursor_idx,
+            p.found_charges  AS detected_charges,
+            p.charges        AS submitted_charges,
+            t.mapped_idx,
+            t.mapped_cnt
+        FROM pid_df t
+        JOIN psm_counts p USING (precursor_idx)
+        ORDER BY t.mapped_idx
+        """
+    ).df()
+
+    # mz_delta quantile distribution (101 points)
+    q_levels = np.linspace(0.0, 1.0, 101)
+    mz_delta_q = pd.DataFrame(
+        {
+            "quantile": q_levels,
+            "mz_delta": np.quantile(mz_delta[within_tol], q_levels).astype(np.float32),
         }
     )
 
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    with mmappet.DatasetWriter(output / "data.mmappet", overwrite_dir=True) as w:
-        w.append_df(data)
-    with mmappet.DatasetWriter(output / "index.mmappet", overwrite_dir=True) as w:
-        w.append_df(index)
+    # ── 6. Write output directory ─────────────────────────────────────────────
+    output_dir = Path(output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    precursors_df.to_parquet(output_dir / "precursors.parquet", index=False)
+    mapping_df.to_parquet(output_dir / "mapping.parquet", index=False)
+    mz_delta_q.to_parquet(output_dir / "mz_delta_quantiles.parquet", index=False)
     if verbose:
+        print(
+            f"  {len(precursors_df):_} precursors, {len(mapping_df):_} mapped fragments"
+        )
         print("Done.")
+
+    if False:
+        from timstofu.stats import count1D
+        from timstofu.plotting import plot_counts
+
+        plot_counts(count1D(precursors_df.mapped_cnt.to_numpy()), xlog=False)
+        plot_counts(
+            count1D(precursors_df.mapped_cnt.to_numpy()), xlog=False, ylog=False
+        )
 
 
 def main():
@@ -422,7 +477,13 @@ def main():
         help="filtered_precursor_clusters_with_nontrivial_ms2.parquet",
     )
     parser.add_argument("pmsms_dir", type=Path, help="pmsms.mmappet directory")
-    parser.add_argument("output", type=Path, help="Output mmappet directory")
+    parser.add_argument("output", type=Path, help="Output parquet file")
+    parser.add_argument(
+        "--mz-err-tol",
+        type=float,
+        default=0.001,
+        help="Maximum absolute m/z error to retain a match (default: 0.001)",
+    )
     args = parser.parse_args()
 
     map_sage_to_pmsms(
@@ -431,8 +492,19 @@ def main():
         precursors_parquet=args.precursors_parquet,
         pmsms_dir=args.pmsms_dir,
         output=args.output,
+        mz_err_tol=args.mz_err_tol,
     )
 
 
 if __name__ == "__main__":
     main()
+    # X = pd.read_csv(matched_fragments, sep="\t")
+    # import matplotlib.pyplot as plt
+    # plt.hexbin(
+    #     np.log10(X.fragment_mz_calculated),
+    #     (X.fragment_mz_experimental - X.fragment_mz_calculated)
+    #     / X.fragment_mz_calculated
+    #     * 1_000_000,
+    #     bins=1000,
+    # )
+    # plt.show()

@@ -28,6 +28,7 @@ tsv2parquet    = "searchops.cli.tsv2parquet:main"
 sage-filter    = "searchops.cli.sage_filter:main"
 sage-summarize     = "searchops.cli.sage_summarize:main"
 sage-pmsms-mapper  = "searchops.cli.sage_pmsms_mapper:main"
+sage_score_mapper  = "searchops.cli.sage_score_mapper:main"
 
 [project.urls]
 homepage   = "https://github.com/MatteoLacki/searchops.git"
