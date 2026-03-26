@@ -62,38 +62,18 @@ if __name__ == "__main__":
     locals().update(**__args)
 
 
-def compare_scores(
-    precursors: str | Path,
-    pmsms: str | Path,
-    mapped_precursors: str | Path,
-    mapping: str | Path,
-    config: str | Path,
-    output: str | Path,
+def _make_plots(
+    output: Path,
+    pmsms_score,
+    log10_int_all,
+    matched_scores,
+    log10_int_matched,
+    charge_per_fragment,
+    score_label: str,
+    filter_label: str = "",
 ):
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-
-    # ── 1. Open files ─────────────────────────────────────────────────────────
-    with open(config, "rb") as fh:
-        cfg = tomllib.load(fh)
-    pmsms_cfg = cfg["pseudomsms"]
-    score_method = pmsms_cfg["tofs_extraction_method"]
-    if score_method == "score":
-        params = pmsms_cfg.get("tofs_extraction_params", {})
-        params_str = " | ".join(f"{k}={v}" for k, v in params.items())
-        score_label = textwrap.fill(f"score | {params_str}", width=80)
-    else:
-        score_label = score_method
-
-    pmsms_data = mmappet.open_dataset_dct(pmsms)
-    pmsms_score = pmsms_data["score"]
-    pmsms_intensity = pmsms_data["intensity"]
-    mapping_df = pd.read_parquet(mapping)
-    mapped_prec_df = pd.read_parquet(mapped_precursors)
-
-    # ── 2. Extract pmsms scores for matched fragments ─────────────────────────
-    matched_idx = mapping_df["pmsms_fragment_idx"].to_numpy()
-    matched_scores = pmsms_score[matched_idx]
+    Path(output).mkdir(parents=True, exist_ok=True)
+    title_suffix = f"\n{filter_label}" if filter_label else ""
 
     # ── 3. Plot histogram ─────────────────────────────────────────────────────
     score_min = float(pmsms_score.min())
@@ -130,18 +110,18 @@ def compare_scores(
     ax.set_xlabel("pmsms score")
     ax.set_ylabel("density")
     ax.set_title(
-        f"{score_label}\n({n_matched:_} matched / {n_unmatched:_} unmatched)",
+        f"{score_label}\n({n_matched:_} matched / {n_unmatched:_} unmatched){title_suffix}",
         fontsize=9,
     )
     fig.tight_layout()
+    if in_ipython:
+        plt.show()
+    else:
+        fig.savefig(output / "score_distribution.png", dpi=150)
+        plt.close(fig)
 
     # ── 4. per-charge conditional histograms ────────────────────────
 
-    # charge label per matched fragment via CSR expansion
-    charge_per_fragment = np.repeat(
-        mapped_prec_df["detected_charges"].to_numpy(),
-        mapped_prec_df["mapped_cnt"].to_numpy(),
-    )
     matched_plot_df = pd.DataFrame(
         {
             "score": matched_scores,
@@ -176,7 +156,7 @@ def compare_scores(
         + P.labs(
             x="pmsms score",
             y="density",
-            title=f"{score_label}\nblue=matched by charge, grey=unmatched (all facets)",
+            title=f"{score_label}\nblue=matched by charge, grey=unmatched (all facets){title_suffix}",
         )
         + P.theme_bw()
         + P.theme(plot_title=P.element_text(size=7))
@@ -190,19 +170,14 @@ def compare_scores(
 
     # ── 5. score vs log10(intensity), matched vs unmatched ──────
 
-    log10_int_all = np.log10(1 + pmsms_intensity.astype(np.float32))
-    log10_int_matched = log10_int_all[matched_idx]
-
     extent = (
-        (float(pmsms_score.min()), float(pmsms_score.max())),
         (float(log10_int_all.min()), float(log10_int_all.max())),
+        (float(pmsms_score.min()), float(pmsms_score.max())),
     )
-    bins = 200
-
-    bins_2d = (bins, bins)
-    h_all = kg.histogram2D(pmsms_score, log10_int_all, extent=extent, bins=bins_2d)
+    bins_2d = (200, 200)
+    h_all = kg.histogram2D(log10_int_all, pmsms_score, extent=extent, bins=bins_2d)
     h_matched = kg.histogram2D(
-        matched_scores, log10_int_matched, extent=extent, bins=bins_2d
+        log10_int_matched, matched_scores, extent=extent, bins=bins_2d
     )
     h_unmatched = h_all - h_matched
 
@@ -218,10 +193,10 @@ def compare_scores(
     )
     for ax, h, label in zip(axes, [h_matched, h_unmatched], ["matched", "unmatched"]):
         ax.imshow(_norm2d(h).T, **imshow_kw)
-        ax.set_xlabel("pmsms score")
-        ax.set_ylabel("log10(intensity)")
+        ax.set_xlabel("log10(intensity+1)")
+        ax.set_ylabel("pmsms score")
         ax.set_title(label)
-    fig.suptitle(score_label, fontsize=9)
+    fig.suptitle(f"{score_label}{title_suffix}", fontsize=9)
     fig.tight_layout()
     if in_ipython:
         plt.show()
@@ -231,8 +206,8 @@ def compare_scores(
 
     # ── 6. Isoquant overlay ───────────────────────────────────────────────────
 
-    x_centers = np.linspace(extent[0][0], extent[0][1], bins)
-    y_centers = np.linspace(extent[1][0], extent[1][1], bins)
+    x_centers = np.linspace(extent[0][0], extent[0][1], bins_2d[0])
+    y_centers = np.linspace(extent[1][0], extent[1][1], bins_2d[1])
 
     def _smooth(h, sigma=2.0):
         return gaussian_filter(_norm2d(h).astype(np.float64), sigma=sigma)
@@ -259,12 +234,82 @@ def compare_scores(
             [Line2D([0], [0], color="steelblue"), Line2D([0], [0], color="darkorange")],
             ["matched", "unmatched"],
         )
-        ax.set_xlabel("pmsms score")
-        ax.set_ylabel("log10(intensity)")
-        ax.set_title(score_label, fontsize=9)
+        ax.set_xlabel("log10(intensity+1)")
+        ax.set_ylabel("pmsms score")
+        ax.set_title(f"{score_label}{title_suffix}", fontsize=9)
         fig.tight_layout()
     if in_ipython:
         plt.show()
     else:
         fig.savefig(output / "score_vs_intensity_isoquants.png", dpi=150)
         plt.close(fig)
+
+
+def compare_scores(
+    precursors: str | Path,
+    pmsms: str | Path,
+    mapped_precursors: str | Path,
+    mapping: str | Path,
+    config: str | Path,
+    output: str | Path,
+):
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. Open files ─────────────────────────────────────────────────────────
+    with open(config, "rb") as fh:
+        cfg = tomllib.load(fh)
+    pmsms_cfg = cfg["pseudomsms"]
+    score_method = pmsms_cfg["tofs_extraction_method"]
+    if score_method == "score":
+        params = pmsms_cfg.get("tofs_extraction_params", {})
+        params_str = " | ".join(f"{k}={v}" for k, v in params.items())
+        score_label = textwrap.fill(f"score | {params_str}", width=80)
+    else:
+        score_label = score_method
+
+    pmsms_data = mmappet.open_dataset_dct(pmsms)
+    pmsms_score = pmsms_data["score"]
+    pmsms_intensity = pmsms_data["intensity"]
+    mapping_df = pd.read_parquet(mapping)
+    mapped_prec_df = pd.read_parquet(mapped_precursors)
+
+    # ── 2. Extract pmsms scores / intensities for matched fragments ───────────
+    matched_idx = mapping_df["pmsms_fragment_idx"].to_numpy()
+    matched_scores = pmsms_score[matched_idx]
+
+    log10_int_all = np.log10(1 + pmsms_intensity.astype(np.float32))
+    log10_int_matched = log10_int_all[matched_idx]
+
+    # charge label per matched fragment via CSR expansion
+    charge_per_fragment = np.repeat(
+        mapped_prec_df["detected_charges"].to_numpy(),
+        mapped_prec_df["mapped_cnt"].to_numpy(),
+    )
+
+    # ── 3-6. Plots: all events ────────────────────────────────────────────────
+    _make_plots(
+        output / "all",
+        pmsms_score,
+        log10_int_all,
+        matched_scores,
+        log10_int_matched,
+        charge_per_fragment,
+        score_label,
+    )
+
+    # ── 3-6. Plots: events above 30th-percentile of matched intensities ───────
+    threshold = float(np.quantile(log10_int_matched, 0.30))
+    above_all = log10_int_all >= threshold
+    above_matched = log10_int_matched >= threshold
+
+    _make_plots(
+        output / "q30",
+        pmsms_score[above_all],
+        log10_int_all[above_all],
+        matched_scores[above_matched],
+        log10_int_matched[above_matched],
+        charge_per_fragment[above_matched],
+        score_label,
+        filter_label=f"log10(intensity+1) ≥ {threshold:.3f} (q30 of matched)",
+    )
