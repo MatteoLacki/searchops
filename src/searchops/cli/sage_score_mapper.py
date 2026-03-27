@@ -30,17 +30,12 @@ def main():
     compare_scores(**args.__dict__)
 
 
-if __name__ == "__main__":
-    try:
-        in_ipython = get_ipython() is not None  # type: ignore[name-defined]
-    except NameError:
-        in_ipython = False
-    if in_ipython:
-        plt.show()
-    else:
-        fig.savefig(output / "score_distribution.png", dpi=150)
-        plt.close(fig)
+try:
+    in_ipython = get_ipython() is not None  # type: ignore[name-defined]
+except NameError:
+    in_ipython = False
 
+if __name__ == "__main__":
     from pprint import pprint
 
     dataset = "F9477"
