@@ -19,6 +19,7 @@ dependencies = [
     "numpy",
     "numba_progress",
     "timstofu",
+    "pydantic",
 ]
 
 [project.scripts]
