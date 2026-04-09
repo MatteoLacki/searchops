@@ -158,7 +158,7 @@ if __name__ == "__main__":
     fasta = "human"
     __args = dict(
         filtered_parquet=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/results.sage.filtered.parquet",
-        matched_fragments=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/dir/matched_fragments.sage.tsv",
+        matched_fragments=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/matched_fragments.sage.parquet",
         precursors_parquet=f"temp/{dataset}/{cfg}/filtered_precursor_clusters_with_nontrivial_ms2.parquet",
         pmsms_dir=f"temp/{dataset}/{cfg}/pmsms.mmappet",
         output=f"/home/matteo/temp/{dataset}_{cfg}_mappedback",
@@ -205,7 +205,7 @@ def map_sage_to_pmsms(
                     row_number() OVER () - 1          AS sage_fragment_idx,
                     psm_id,
                     fragment_mz_experimental
-                FROM read_csv('{matched_fragments}', sep='\\t', header=true)
+                FROM read_parquet('{matched_fragments}')
             ),
             psm_map AS (
                 SELECT
@@ -237,7 +237,7 @@ def map_sage_to_pmsms(
                 row_number() OVER () - 1  AS sage_fragment_idx,
                 psm_id,
                 fragment_mz_experimental
-            FROM read_csv('{matched_fragments}', sep='\\t', header=true)
+            FROM read_parquet('{matched_fragments}')
             """
         ).df()
 
@@ -383,7 +383,7 @@ def map_sage_to_pmsms(
 
     if verbose:
         print(
-            f"  {within_tol.sum():_} / {nn_matched.sum():_} = {within_tol.sum() / nn_matched.sum():.2f}% fragments within mz_err_tol={mz_err_tol}"
+            f"  {within_tol.sum():_} / {nn_matched.sum():_} = {within_tol.sum() / nn_matched.sum() * 100 :.2f} % fragments within mz_err_tol={mz_err_tol}"
         )
         print(f"Writing to {output} ...")
 

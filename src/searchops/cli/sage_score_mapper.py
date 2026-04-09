@@ -1,6 +1,7 @@
 import argparse
 import textwrap
 import tomllib
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import plotnine as P
@@ -38,10 +39,10 @@ except NameError:
 if __name__ == "__main__":
     from pprint import pprint
 
-    dataset = "F9477"
     dataset = "F9468"
-    cfg = "optimal2tier"
-    sage_version = "devel"
+    dataset = "F9477"
+    cfg = "optimal2tier4"
+    sage_version = "devel_fixed"
     sage_cfg = "p12f15"
     fasta = "human"
 
@@ -55,36 +56,29 @@ if __name__ == "__main__":
     )
     pprint(__args)
     locals().update(**__args)
+    filter_label = ""
+    score_label = ""
 
 
-def _make_plots(
+# ── Individual plot functions (each saves one file) ───────────────────────────
+
+
+def _plot_score_distribution(
     output: Path,
-    pmsms_score,
-    log10_int_all,
-    matched_scores,
-    log10_int_matched,
-    charge_per_fragment,
+    edges,
+    all_counts,
+    matched_counts,
     score_label: str,
     filter_label: str = "",
 ):
-    Path(output).mkdir(parents=True, exist_ok=True)
-    title_suffix = f"\n{filter_label}" if filter_label else ""
-
-    # ── 3. Plot histogram ─────────────────────────────────────────────────────
-    score_min = float(pmsms_score.min())
-    score_max = float(pmsms_score.max())
-    bins = np.linspace(score_min, score_max, 101)
-
-    all_counts, edges = np.histogram(pmsms_score, bins=bins)
-    matched_counts, _ = np.histogram(matched_scores, bins=bins)
     unmatched_counts = all_counts - matched_counts
+    n_matched = int(matched_counts.sum())
+    n_unmatched = int(unmatched_counts.sum())
+    title_suffix = f"\n{filter_label}" if filter_label else ""
 
     def _density(counts):
         widths = np.diff(edges)
         return counts / (counts.sum() * widths)
-
-    n_matched = int(matched_counts.sum())
-    n_unmatched = int(unmatched_counts.sum())
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.stairs(
@@ -115,7 +109,18 @@ def _make_plots(
         fig.savefig(output / "score_distribution.png", dpi=150)
         plt.close(fig)
 
-    # ── 4. per-charge conditional histograms ────────────────────────
+
+def _plot_score_by_charge(
+    output: Path,
+    edges,
+    matched_scores,
+    charge_per_fragment,
+    unmatched_counts,
+    score_label: str,
+    filter_label: str = "",
+):
+    title_suffix = f"\n{filter_label}" if filter_label else ""
+    n_unmatched = int(unmatched_counts.sum())
 
     matched_plot_df = pd.DataFrame(
         {
@@ -124,8 +129,6 @@ def _make_plots(
         }
     )
 
-    # Reconstruct an unmatched reference sample from the pre-computed histogram
-    # (avoids materialising a ~187M array).  No 'charge' column → appears in all facets.
     bin_centers = (edges[:-1] + edges[1:]) / 2
     rng = np.random.default_rng(0)
     unmatched_sample = rng.choice(
@@ -163,18 +166,16 @@ def _make_plots(
             output / "score_by_charge.png", dpi=150, verbose=False, width=14, height=6
         )
 
-    # ── 5. score vs log10(intensity), matched vs unmatched ──────
 
-    extent = (
-        (float(log10_int_all.min()), float(log10_int_all.max())),
-        (float(pmsms_score.min()), float(pmsms_score.max())),
-    )
-    bins_2d = (200, 200)
-    h_all = kg.histogram2D(log10_int_all, pmsms_score, extent=extent, bins=bins_2d)
-    h_matched = kg.histogram2D(
-        log10_int_matched, matched_scores, extent=extent, bins=bins_2d
-    )
-    h_unmatched = h_all - h_matched
+def _plot_score_vs_intensity_2d(
+    output: Path,
+    h_matched,
+    h_unmatched,
+    extent,
+    score_label: str,
+    filter_label: str = "",
+):
+    title_suffix = f"\n{filter_label}" if filter_label else ""
 
     def _norm2d(h):
         return h / h.sum()
@@ -199,17 +200,28 @@ def _make_plots(
         fig.savefig(output / "score_vs_intensity_2d.png", dpi=150)
         plt.close(fig)
 
-    # ── 6. Isoquant overlay ───────────────────────────────────────────────────
 
+def _plot_score_vs_intensity_isoquants(
+    output: Path,
+    h_matched,
+    h_unmatched,
+    extent,
+    bins_2d,
+    score_label: str,
+    filter_label: str = "",
+):
+    title_suffix = f"\n{filter_label}" if filter_label else ""
     x_centers = np.linspace(extent[0][0], extent[0][1], bins_2d[0])
     y_centers = np.linspace(extent[1][0], extent[1][1], bins_2d[1])
+
+    def _norm2d(h):
+        return h / h.sum()
 
     def _smooth(h, sigma=2.0):
         return gaussian_filter(_norm2d(h).astype(np.float64), sigma=sigma)
 
     with plt.style.context("dark_background"):
         fig, ax = plt.subplots(figsize=(8, 5))
-
         levels = 10
         ax.contour(
             x_centers,
@@ -238,6 +250,87 @@ def _make_plots(
     else:
         fig.savefig(output / "score_vs_intensity_isoquants.png", dpi=150)
         plt.close(fig)
+
+
+# ── Histogram pre-computation + task list ─────────────────────────────────────
+
+
+def _make_plots(
+    output: Path,
+    pmsms_score,
+    log10_int_all,
+    matched_scores,
+    log10_int_matched,
+    charge_per_fragment,
+    score_label: str,
+    filter_label: str = "",
+):
+    """Pre-compute shared histograms and return a list of (fn, kwargs) plot tasks."""
+    Path(output).mkdir(parents=True, exist_ok=True)
+
+    score_min = float(pmsms_score.min())
+    score_max = float(pmsms_score.max())
+    bins = np.linspace(score_min, score_max, 101)
+    all_counts, edges = np.histogram(pmsms_score, bins=bins)
+    matched_counts, _ = np.histogram(matched_scores, bins=bins)
+    unmatched_counts = all_counts - matched_counts
+
+    extent = (
+        (float(log10_int_all.min()), float(log10_int_all.max())),
+        (float(pmsms_score.min()), float(pmsms_score.max())),
+    )
+    bins_2d = (200, 200)
+    h_all = kg.histogram2D(log10_int_all, pmsms_score, extent=extent, bins=bins_2d)
+    h_matched_2d = kg.histogram2D(
+        log10_int_matched, matched_scores, extent=extent, bins=bins_2d
+    )
+    h_unmatched_2d = h_all - h_matched_2d
+
+    common = dict(score_label=score_label, filter_label=filter_label)
+    return [
+        (
+            _plot_score_distribution,
+            dict(
+                output=output,
+                edges=edges,
+                all_counts=all_counts,
+                matched_counts=matched_counts,
+                **common,
+            ),
+        ),
+        (
+            _plot_score_by_charge,
+            dict(
+                output=output,
+                edges=edges,
+                matched_scores=matched_scores,
+                charge_per_fragment=charge_per_fragment,
+                unmatched_counts=unmatched_counts,
+                **common,
+            ),
+        ),
+        (
+            _plot_score_vs_intensity_2d,
+            dict(
+                output=output,
+                h_matched=h_matched_2d,
+                h_unmatched=h_unmatched_2d,
+                extent=extent,
+                **common,
+            ),
+        ),
+        (
+            _plot_score_vs_intensity_isoquants,
+            dict(
+                output=output,
+                h_matched=h_matched_2d,
+                h_unmatched=h_unmatched_2d,
+                extent=extent,
+                bins_2d=bins_2d,
+                **common,
+            ),
+        ),
+    ]
 
 
 def compare_scores(
@@ -276,14 +369,17 @@ def compare_scores(
     log10_int_all = np.log10(1 + pmsms_intensity.astype(np.float32))
     log10_int_matched = log10_int_all[matched_idx]
 
-    # charge label per matched fragment via CSR expansion
     charge_per_fragment = np.repeat(
         mapped_prec_df["detected_charges"].to_numpy(),
         mapped_prec_df["mapped_cnt"].to_numpy(),
     )
 
-    # ── 3-6. Plots: all events ────────────────────────────────────────────────
-    _make_plots(
+    threshold = float(np.quantile(log10_int_matched, 0.30))
+    above_all = log10_int_all >= threshold
+    above_matched = log10_int_matched >= threshold
+
+    # ── 3. Build all plot tasks (all + q30 filter levels) ────────────────────
+    tasks = _make_plots(
         output / "all",
         pmsms_score,
         log10_int_all,
@@ -291,14 +387,7 @@ def compare_scores(
         log10_int_matched,
         charge_per_fragment,
         score_label,
-    )
-
-    # ── 3-6. Plots: events above 30th-percentile of matched intensities ───────
-    threshold = float(np.quantile(log10_int_matched, 0.30))
-    above_all = log10_int_all >= threshold
-    above_matched = log10_int_matched >= threshold
-
-    _make_plots(
+    ) + _make_plots(
         output / "q30",
         pmsms_score[above_all],
         log10_int_all[above_all],
@@ -308,3 +397,15 @@ def compare_scores(
         score_label,
         filter_label=f"log10(intensity+1) ≥ {threshold:.3f} (q30 of matched)",
     )
+
+    # ── 4. Run plots: parallel in pipeline, sequential in IPython ────────────
+    if in_ipython:
+        for fn, kwargs in tasks:
+            fn(**kwargs)
+    else:
+        with ProcessPoolExecutor(max_workers=len(tasks)) as pool:
+            futures = [pool.submit(fn, **kwargs) for fn, kwargs in tasks]
+            for f in futures:
+                f.result()
+
+    print("   Done!")
