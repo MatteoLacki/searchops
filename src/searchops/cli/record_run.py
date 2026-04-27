@@ -38,7 +38,10 @@ CREATE TABLE IF NOT EXISTS runs (
     ion_count        INTEGER,
     protein_count    INTEGER,
     accepted         INTEGER NOT NULL DEFAULT 0,
-    acceptance_reason TEXT
+    acceptance_reason TEXT,
+    status           TEXT NOT NULL DEFAULT 'unreviewed',
+    regression       INTEGER NOT NULL DEFAULT 0,
+    message          TEXT
 );
 CREATE TABLE IF NOT EXISTS git_snapshots (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,10 +59,118 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
     migrations = {
         "accepted": "ALTER TABLE runs ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0",
         "acceptance_reason": "ALTER TABLE runs ADD COLUMN acceptance_reason TEXT",
+        "status": "ALTER TABLE runs ADD COLUMN status TEXT NOT NULL DEFAULT 'unreviewed'",
+        "regression": "ALTER TABLE runs ADD COLUMN regression INTEGER NOT NULL DEFAULT 0",
+        "message": "ALTER TABLE runs ADD COLUMN message TEXT",
     }
     for column, sql in migrations.items():
         if column not in existing:
             con.execute(sql)
+    columns = existing | migrations.keys()
+    if {"accepted", "acceptance_reason", "status", "regression", "message"} <= columns:
+        con.execute(
+            """
+            UPDATE runs
+            SET status = 'reviewed',
+                regression = 0,
+                message = COALESCE(message, acceptance_reason)
+            WHERE accepted = 1
+              AND status = 'unreviewed'
+            """
+        )
+
+
+def _read_marker_run_id(marker: Path) -> int:
+    try:
+        lines = marker.read_text().splitlines()
+    except OSError as exc:
+        raise SystemExit(f"Could not read marker {marker}: {exc}") from exc
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if key == "run_id" and sep:
+            try:
+                return int(value)
+            except ValueError as exc:
+                raise SystemExit(f"Invalid run_id in marker {marker}: {value!r}") from exc
+    raise SystemExit(f"Marker does not contain run_id: {marker}")
+
+
+def _review_run(
+    db_path: Path,
+    *,
+    marker: Path,
+    regression: bool,
+    message: str | None,
+) -> int:
+    run_id = _read_marker_run_id(marker)
+    con = sqlite3.connect(db_path)
+    _ensure_schema(con)
+    with con:
+        cur = con.execute(
+            """
+            UPDATE runs
+            SET status = 'reviewed',
+                regression = ?,
+                message = ?
+            WHERE id = ?
+            """,
+            (int(regression), message, run_id),
+        )
+    con.close()
+    if cur.rowcount != 1:
+        raise SystemExit(f"No run found for run_id={run_id}")
+    return run_id
+
+
+def _mark_bested_for_marker(db_path: Path, *, marker: Path, message: str | None) -> int:
+    run_id = _read_marker_run_id(marker)
+    con = sqlite3.connect(db_path)
+    _ensure_schema(con)
+    row = con.execute(
+        """
+        SELECT dataset, cfg, search_engine, peptide_count
+        FROM runs
+        WHERE id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        con.close()
+        raise SystemExit(f"No run found for run_id={run_id}")
+    dataset, cfg, search_engine, peptide_count = row
+    previous_best = con.execute(
+        """
+        SELECT MAX(peptide_count)
+        FROM runs
+        WHERE dataset = ?
+          AND cfg = ?
+          AND search_engine = ?
+          AND id <> ?
+        """,
+        (dataset, cfg, search_engine, run_id),
+    ).fetchone()[0]
+    if previous_best is not None and peptide_count <= previous_best:
+        con.close()
+        raise SystemExit(
+            f"run_id={run_id} is not better than the previous best "
+            f"peptide_count={previous_best}"
+        )
+    with con:
+        cur = con.execute(
+            """
+            UPDATE runs
+            SET status = 'bested',
+                message = COALESCE(?, message)
+            WHERE dataset = ?
+              AND cfg = ?
+              AND search_engine = ?
+              AND id <> ?
+              AND status = 'unreviewed'
+            """,
+            (message, dataset, cfg, search_engine, run_id),
+        )
+    con.close()
+    return cur.rowcount
 
 # ---------- summary parsers ------------------------------------------------
 
@@ -143,6 +254,9 @@ def _write_to_db(
     counts: dict[str, int | None],
     accepted: bool,
     acceptance_reason: str | None,
+    status: str,
+    regression: bool,
+    message: str | None,
     git_rows: list[dict],
 ) -> int:
     con = sqlite3.connect(db_path)
@@ -155,8 +269,8 @@ def _write_to_db(
                 (pipeline_path, run_date, search_engine, dataset, cfg,
                  pipeline_config, search_config, pipeline_call, search_tool_call,
                  psm_count, peptide_count, ion_count, protein_count,
-                 accepted, acceptance_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 accepted, acceptance_reason, status, regression, message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pipeline_path,
@@ -174,6 +288,9 @@ def _write_to_db(
                 counts.get("protein_count"),
                 int(accepted),
                 acceptance_reason,
+                status,
+                int(regression),
+                message,
             ),
         )
         run_id = cur.lastrowid
@@ -244,6 +361,25 @@ def main():
         help="Reason stored with an accepted run. Required with --accept-run.",
     )
     p.add_argument(
+        "--review-marker",
+        type=Path,
+        help="Marker for an existing recorded run to mark as reviewed.",
+    )
+    p.add_argument(
+        "--regression",
+        choices=("0", "1"),
+        help="Regression flag for --review-marker: 1 means reviewed bad regression.",
+    )
+    p.add_argument(
+        "--message",
+        help="Optional review/status message.",
+    )
+    p.add_argument(
+        "--mark-bested-marker",
+        type=Path,
+        help="Marker for a new best run; older unreviewed matching runs become bested.",
+    )
+    p.add_argument(
         "--no-prompt",
         action="store_true",
         help="Do not prompt for acceptance even when stdin is interactive.",
@@ -262,6 +398,28 @@ def main():
         _ensure_schema(con)
         con.close()
         print(f"Regression DB initialised at {db_path}")
+        return
+
+    if args.review_marker:
+        if args.regression is None:
+            p.error("--regression is required with --review-marker")
+        run_id = _review_run(
+            Path(db_path),
+            marker=args.review_marker,
+            regression=args.regression == "1",
+            message=args.message,
+        )
+        print(f"run_id={run_id}")
+        print(f"status=reviewed regression={args.regression}")
+        return
+
+    if args.mark_bested_marker:
+        count = _mark_bested_for_marker(
+            Path(db_path),
+            marker=args.mark_bested_marker,
+            message=args.message,
+        )
+        print(f"bested={count}")
         return
 
     if not args.run_info or not args.summary or not args.git_root or not args.marker:
@@ -314,6 +472,9 @@ def main():
         counts=counts,
         accepted=accepted,
         acceptance_reason=acceptance_reason,
+        status="reviewed" if accepted else "unreviewed",
+        regression=False,
+        message=acceptance_reason,
         git_rows=git_rows,
     )
 
@@ -321,6 +482,9 @@ def main():
     args.marker.write_text(
         f"run_id={run_id}\naccepted={int(accepted)}\n"
         f"acceptance_reason={acceptance_reason or ''}\n"
+        f"status={'reviewed' if accepted else 'unreviewed'}\n"
+        "regression=0\n"
+        f"message={acceptance_reason or ''}\n"
     )
     print(f"run_id={run_id}")
     if accepted:
