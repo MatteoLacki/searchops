@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +36,9 @@ CREATE TABLE IF NOT EXISTS runs (
     psm_count        INTEGER,
     peptide_count    INTEGER,
     ion_count        INTEGER,
-    protein_count    INTEGER
+    protein_count    INTEGER,
+    accepted         INTEGER NOT NULL DEFAULT 0,
+    acceptance_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS git_snapshots (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,6 +48,18 @@ CREATE TABLE IF NOT EXISTS git_snapshots (
     commit_hash  TEXT NOT NULL
 );
 """
+
+
+def _ensure_schema(con: sqlite3.Connection) -> None:
+    con.executescript(_DDL)
+    existing = {row[1] for row in con.execute("PRAGMA table_info(runs)")}
+    migrations = {
+        "accepted": "ALTER TABLE runs ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0",
+        "acceptance_reason": "ALTER TABLE runs ADD COLUMN acceptance_reason TEXT",
+    }
+    for column, sql in migrations.items():
+        if column not in existing:
+            con.execute(sql)
 
 # ---------- summary parsers ------------------------------------------------
 
@@ -126,10 +141,12 @@ def _write_to_db(
     pipeline_call: str | None,
     search_tool_call: str | None,
     counts: dict[str, int | None],
+    accepted: bool,
+    acceptance_reason: str | None,
     git_rows: list[dict],
 ) -> int:
     con = sqlite3.connect(db_path)
-    con.executescript(_DDL)
+    _ensure_schema(con)
     run_date = datetime.now(timezone.utc).isoformat()
     with con:
         cur = con.execute(
@@ -137,8 +154,9 @@ def _write_to_db(
             INSERT INTO runs
                 (pipeline_path, run_date, search_engine, dataset, cfg,
                  pipeline_config, search_config, pipeline_call, search_tool_call,
-                 psm_count, peptide_count, ion_count, protein_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 psm_count, peptide_count, ion_count, protein_count,
+                 accepted, acceptance_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pipeline_path,
@@ -154,6 +172,8 @@ def _write_to_db(
                 counts.get("peptide_count"),
                 counts.get("ion_count"),
                 counts.get("protein_count"),
+                int(accepted),
+                acceptance_reason,
             ),
         )
         run_id = cur.lastrowid
@@ -167,6 +187,19 @@ def _write_to_db(
         )
     con.close()
     return run_id
+
+
+def _ask_for_acceptance(counts: dict[str, int | None]) -> tuple[bool, str | None]:
+    print("Run summary:")
+    print("  " + "  ".join(f"{k}={v}" for k, v in counts.items()))
+    answer = input("Accept this run as a regression baseline? [y/N] ").strip().lower()
+    accepted = answer in {"y", "yes"}
+    if not accepted:
+        return False, None
+    reason = input("Reason for accepting this run: ").strip()
+    while not reason:
+        reason = input("Reason is required. Reason for accepting this run: ").strip()
+    return True, reason
 
 
 # ---------- CLI ------------------------------------------------------------
@@ -201,6 +234,20 @@ def main():
         type=Path,
         help="Output marker file; Snakemake uses this to track completion.",
     )
+    p.add_argument(
+        "--accept-run",
+        action="store_true",
+        help="Mark this recorded run as an accepted regression baseline.",
+    )
+    p.add_argument(
+        "--acceptance-reason",
+        help="Reason stored with an accepted run. Required with --accept-run.",
+    )
+    p.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Do not prompt for acceptance even when stdin is interactive.",
+    )
     args = p.parse_args()
 
     db_path = os.environ.get("ION_MAIDEN_REGRESSION_DB")
@@ -212,7 +259,7 @@ def main():
 
     if args.init_db:
         con = sqlite3.connect(db_path)
-        con.executescript(_DDL)
+        _ensure_schema(con)
         con.close()
         print(f"Regression DB initialised at {db_path}")
         return
@@ -244,6 +291,14 @@ def main():
     else:
         counts = _parse_fragpipe_summary(args.summary)
 
+    if args.accept_run and not args.acceptance_reason:
+        p.error("--acceptance-reason is required with --accept-run")
+
+    accepted = args.accept_run
+    acceptance_reason = args.acceptance_reason
+    if not accepted and not args.no_prompt and sys.stdin.isatty():
+        accepted, acceptance_reason = _ask_for_acceptance(counts)
+
     git_rows = _capture_git_snapshot(args.git_root)
 
     run_id = _write_to_db(
@@ -257,12 +312,19 @@ def main():
         pipeline_call=run_info.get("pipeline_call"),
         search_tool_call=run_info.get("search_tool_call"),
         counts=counts,
+        accepted=accepted,
+        acceptance_reason=acceptance_reason,
         git_rows=git_rows,
     )
 
     args.marker.parent.mkdir(parents=True, exist_ok=True)
-    args.marker.write_text(f"run_id={run_id}\n")
+    args.marker.write_text(
+        f"run_id={run_id}\naccepted={int(accepted)}\n"
+        f"acceptance_reason={acceptance_reason or ''}\n"
+    )
     print(f"run_id={run_id}")
+    if accepted:
+        print(f"accepted=1 reason={acceptance_reason}")
 
 
 if __name__ == "__main__":
