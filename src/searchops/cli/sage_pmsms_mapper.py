@@ -147,6 +147,71 @@ def _match_fragments_numba(
             progress.update(1)
 
 
+@numba.njit(parallel=True, boundscheck=True)
+def _match_fragments_tof2mz_numba(
+    frag_start,  # int64[N_groups] — fragment_spectrum_start per PSM group
+    frag_cnt,  # int64[N_groups] — fragment_event_cnt per PSM group
+    psm_idx,  # int64[N_groups + 1] — CSR over exp_mz_arr
+    pmsms_tof,  # uint32[N_frags] — sorted within each precursor slice
+    tof2mz,  # float32[N_tofs] — non-decreasing TOF-to-m/z axis
+    exp_mz_arr,  # float32[N_rows] — experimental fragment m/z
+    out_idx,  # int64[N_rows] — output: absolute pmsms fragment index
+    progress=None,
+):
+    """TOF-backed nearest-neighbour fragment matching.
+
+    This is the same two-pointer algorithm as _match_fragments_numba, but it
+    derives library m/z as tof2mz[pmsms_tof[row]] instead of reading pmsms["mz"].
+    """
+    for i in numba.prange(len(frag_start)):
+        gs = psm_idx[i]
+        ge = psm_idx[i + 1]
+        start = frag_start[i]
+        cnt = frag_cnt[i]
+        if cnt == np.int64(0):
+            if progress is not None:
+                progress.update(1)
+            continue
+        p = np.int64(0)
+        for j in range(gs, ge):
+            q = exp_mz_arr[j]
+            while p + np.int64(1) < cnt and abs(
+                tof2mz[pmsms_tof[start + p + np.int64(1)]] - q
+            ) < abs(tof2mz[pmsms_tof[start + p]] - q):
+                p += np.int64(1)
+            out_idx[j] = start + p
+        if progress is not None:
+            progress.update(1)
+
+
+def _load_fragment_mz(
+    pmsms_dir: Path,
+    tof2mz_path: Path | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    fragments = mmappet.open_dataset_dct(pmsms_dir)
+    if tof2mz_path is None:
+        if "mz" not in fragments:
+            raise ValueError("pmsms fragments need 'mz' unless --tof2mz is provided")
+        return fragments["mz"], None, None
+
+    if "tof" not in fragments:
+        raise ValueError("pmsms fragments need 'tof' when --tof2mz is provided")
+
+    tof2mz = mmappet.open_dataset_dct(tof2mz_path)["x"]
+    if len(tof2mz) == 0:
+        raise ValueError(f"tof2mz table is empty: {tof2mz_path}")
+    if np.any(np.diff(tof2mz) < 0):
+        raise ValueError(f"tof2mz table must be non-decreasing: {tof2mz_path}")
+
+    pmsms_tof = fragments["tof"]
+    max_tof = int(pmsms_tof.max()) if len(pmsms_tof) else -1
+    if max_tof >= len(tof2mz):
+        raise ValueError(
+            f"fragment tof {max_tof} is out of bounds for tof2mz length {len(tof2mz)}"
+        )
+    return None, pmsms_tof, tof2mz
+
+
 if __name__ == "__main__":
     from pprint import pprint
 
@@ -179,17 +244,20 @@ def map_sage_to_pmsms(
     mz_err_tol: float = 0.001,
     verbose: bool = True,
     use_duckdb: bool = True,
+    tof2mz_path: Path | None = None,
 ) -> None:
     """Map sage FDR-filtered PSMs and matched fragments to pmsms.mmappet entries.
 
     Writes a directory containing three parquet files (see module docstring).
     """
-    # ── 1. Load pmsms_mz (only column needed for matching) ───────────────────
+    # ── 1. Load fragment m/z source ──────────────────────────────────────────
     if verbose:
-        print("Loading pmsms mz...")
-    pmsms_mz = mmappet.open_dataset_dct(pmsms_dir)["mz"]
+        print("Loading pmsms fragment m/z source...")
+    pmsms_mz, pmsms_tof, tof2mz = _load_fragment_mz(pmsms_dir, tof2mz_path)
+    n_fragments = len(pmsms_tof) if tof2mz_path is not None else len(pmsms_mz)
     if verbose:
-        print(f"  {len(pmsms_mz):_} fragment peaks")
+        mode = "tof2mz" if tof2mz_path is not None else "stored mz"
+        print(f"  {n_fragments:_} fragment peaks ({mode})")
 
     # ── 2. Load PSMs + matched fragments, resolve precursor slices ────────────
     if verbose:
@@ -293,7 +361,7 @@ def map_sage_to_pmsms(
 
     # exp_mz_arr and sage_fragment_idx_arr come from merged (already sorted by precursor_idx)
     # so their order is guaranteed to match psm_counts below.
-    exp_mz_arr = merged["fragment_mz_experimental"].to_numpy(dtype=np.float32)
+    exp_mz_arr = merged["fragment_mz_experimental"].to_numpy(dtype=np.float32).copy()
 
     sage_fragment_idx_arr = merged["sage_fragment_idx"].to_numpy(dtype=np.int64)
 
@@ -359,15 +427,27 @@ def map_sage_to_pmsms(
     pmsms_fragment_idx = np.full(len(exp_mz_arr), -1, dtype=np.int64)
 
     with ProgressBar(total=len(psm_counts), desc="Matching precursors") as progress:
-        _match_fragments_numba(
-            frag_start=psm_counts.fragment_spectrum_start.to_numpy(),
-            frag_cnt=psm_counts.fragment_event_cnt.to_numpy(),
-            psm_idx=psm_idx,
-            pmsms_mz=pmsms_mz,
-            exp_mz_arr=exp_mz_arr,
-            out_idx=pmsms_fragment_idx,
-            progress=progress,
-        )
+        if tof2mz_path is not None:
+            _match_fragments_tof2mz_numba(
+                frag_start=psm_counts.fragment_spectrum_start.to_numpy(),
+                frag_cnt=psm_counts.fragment_event_cnt.to_numpy(),
+                psm_idx=psm_idx,
+                pmsms_tof=pmsms_tof,
+                tof2mz=tof2mz,
+                exp_mz_arr=exp_mz_arr,
+                out_idx=pmsms_fragment_idx,
+                progress=progress,
+            )
+        else:
+            _match_fragments_numba(
+                frag_start=psm_counts.fragment_spectrum_start.to_numpy(),
+                frag_cnt=psm_counts.fragment_event_cnt.to_numpy(),
+                psm_idx=psm_idx,
+                pmsms_mz=pmsms_mz,
+                exp_mz_arr=exp_mz_arr,
+                out_idx=pmsms_fragment_idx,
+                progress=progress,
+            )
 
     nn_matched = pmsms_fragment_idx != -1
     skipped = len(pmsms_fragment_idx) - nn_matched.sum()
@@ -378,7 +458,10 @@ def map_sage_to_pmsms(
 
     # ── 4. Apply mz tolerance filter ─────────────────────────────────────────
     matched_frag_idx = pmsms_fragment_idx[nn_matched]
-    mz_delta = pmsms_mz[matched_frag_idx] - exp_mz_arr[nn_matched]
+    if tof2mz_path is not None:
+        mz_delta = tof2mz[pmsms_tof[matched_frag_idx]] - exp_mz_arr[nn_matched]
+    else:
+        mz_delta = pmsms_mz[matched_frag_idx] - exp_mz_arr[nn_matched]
     within_tol = np.abs(mz_delta) <= mz_err_tol
 
     if verbose:
@@ -484,6 +567,12 @@ def main():
         default=0.001,
         help="Maximum absolute m/z error to retain a match (default: 0.001)",
     )
+    parser.add_argument(
+        "--tof2mz",
+        type=Path,
+        default=None,
+        help="Path to fragment tof2mz.mmappet. When provided, pmsms fragments need tof instead of mz.",
+    )
     args = parser.parse_args()
 
     map_sage_to_pmsms(
@@ -493,6 +582,7 @@ def main():
         pmsms_dir=args.pmsms_dir,
         output=args.output,
         mz_err_tol=args.mz_err_tol,
+        tof2mz_path=args.tof2mz,
     )
 
 
