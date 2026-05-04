@@ -18,6 +18,7 @@ def main():
         COPY (
             SELECT * FROM read_parquet('{args.input}')
             WHERE peptide_q <= {args.fdr}
+              AND label = 1
         ) TO '{args.output}' (FORMAT PARQUET)
     """)
 
