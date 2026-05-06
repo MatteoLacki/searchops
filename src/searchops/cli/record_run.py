@@ -337,6 +337,19 @@ def main():
         help="JSON sidecar written by the Snakemake search rule.",
     )
     p.add_argument(
+        "--dataset",
+        help="Dataset identifier. Overrides the value in --run-info.",
+    )
+    p.add_argument(
+        "--cfg",
+        help="Pipeline config identifier. Overrides the value in --run-info.",
+    )
+    p.add_argument(
+        "--pipeline-config-path",
+        type=Path,
+        help="Pipeline config TOML path. Overrides the value in --run-info.",
+    )
+    p.add_argument(
         "--summary",
         type=Path,
         help="FDR-filtered summary file (sage_summary.tsv or fragpipe log_summary.txt).",
@@ -427,9 +440,15 @@ def main():
 
     run_info = json.loads(args.run_info.read_text())
     search_engine = run_info["search_engine"]
+    dataset = args.dataset or run_info.get("dataset")
+    cfg = args.cfg or run_info.get("cfg")
+    if not dataset or not cfg:
+        raise SystemExit(
+            "dataset and cfg are required; pass --dataset/--cfg or include them in --run-info."
+        )
 
     pipeline_config = None
-    cfg_path = run_info.get("pipeline_config_path")
+    cfg_path = args.pipeline_config_path or run_info.get("pipeline_config_path")
     if cfg_path:
         try:
             pipeline_config = Path(cfg_path).read_text()
@@ -463,8 +482,8 @@ def main():
         Path(db_path),
         pipeline_path=str(Path(".").resolve()),
         search_engine=search_engine,
-        dataset=run_info["dataset"],
-        cfg=run_info["cfg"],
+        dataset=dataset,
+        cfg=cfg,
         pipeline_config=pipeline_config,
         search_config=search_config,
         pipeline_call=run_info.get("pipeline_call"),
