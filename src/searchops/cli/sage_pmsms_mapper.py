@@ -279,7 +279,7 @@ def map_sage_to_pmsms(
                 SELECT
                     psm_id,
                     CAST(regexp_extract(scannr, 'precursor_idx=(\\d+)', 1) AS BIGINT) AS precursor_idx,
-                    CAST(regexp_extract(scannr, 'charge=(\\d+)', 1) AS INTEGER)       AS charge
+                    charge
                 FROM read_parquet('{filtered_parquet}')
             ),
             prec AS (
@@ -309,13 +309,13 @@ def map_sage_to_pmsms(
             """
         ).df()
 
-        # precursor_idx and charge extracted from scannr (one row per PSM)
+        # precursor_idx extracted from scannr, charge read directly (one row per PSM)
         psm_map = duckdb.sql(
             f"""
             SELECT
                 psm_id,
                 CAST(regexp_extract(scannr, 'precursor_idx=(\\d+)', 1) AS BIGINT) AS precursor_idx,
-                CAST(regexp_extract(scannr, 'charge=(\\d+)', 1) AS INTEGER)       AS charge
+                charge
             FROM read_parquet('{filtered_parquet}')
             """
         ).df()
