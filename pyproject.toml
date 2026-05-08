@@ -18,6 +18,7 @@ dependencies = [
     "numba",
     "numpy",
     "numba_progress",
+    "plotnine",
     "timstofu",
     "pydantic",
 ]
@@ -31,6 +32,7 @@ sage-summarize     = "searchops.cli.sage_summarize:main"
 sage-pmsms-mapper  = "searchops.cli.sage_pmsms_mapper:main"
 sage_score_mapper  = "searchops.cli.sage_score_mapper:main"
 record-run         = "searchops.cli.record_run:main"
+score-delta-plots  = "searchops.cli.score_delta_plots:main"
 
 [project.urls]
 homepage   = "https://github.com/MatteoLacki/searchops.git"
