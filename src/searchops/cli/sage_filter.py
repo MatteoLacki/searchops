@@ -17,7 +17,7 @@ def main():
     duckdb.sql(f"""
         COPY (
             SELECT * FROM read_parquet('{args.input}')
-            WHERE peptide_q <= {args.fdr}
+            WHERE TRY_CAST(peptide_q AS DOUBLE) <= {args.fdr}
               AND label = 1
         ) TO '{args.output}' (FORMAT PARQUET)
     """)

@@ -30,6 +30,7 @@ from pathlib import Path
 
 import mmappet
 from numba_progress import ProgressBar
+from pandas_ops.io import read_df
 from timstofu.stats import get_index
 
 
@@ -224,7 +225,7 @@ if __name__ == "__main__":
     __args = dict(
         filtered_parquet=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/results.sage.filtered.parquet",
         matched_fragments=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/matched_fragments.sage.parquet",
-        precursors_parquet=f"temp/{dataset}/{cfg}/filtered_precursor_clusters_with_nontrivial_ms2.parquet",
+        precursors_parquet=f"temp/{dataset}/{cfg}/filtered_precursor_clusters_with_nontrivial_ms2.mmappet",
         pmsms_dir=f"temp/{dataset}/{cfg}/pmsms.mmappet",
         output=f"/home/matteo/temp/{dataset}_{cfg}_mappedback",
         verbose=True,
@@ -263,10 +264,14 @@ def map_sage_to_pmsms(
     if verbose:
         print("Loading sage PSMs and matched fragments...")
 
+    con = duckdb.connect()
+    prec_df = read_df(precursors_parquet)
+    con.register("precursors_tbl", prec_df)
+
     if use_duckdb:
         # One row per matched fragment, sorted by precursor_idx, with original
         # file row index preserved for back-referencing the TSV after reordering.
-        merged = duckdb.sql(
+        merged = con.sql(
             f"""
             WITH raw AS (
                 SELECT
@@ -284,7 +289,7 @@ def map_sage_to_pmsms(
             ),
             prec AS (
                 SELECT precursor_idx, fragment_spectrum_start, fragment_event_cnt, charges
-                FROM read_parquet('{precursors_parquet}')
+                FROM precursors_tbl
                 WHERE fragment_event_cnt > 0
             )
             SELECT
@@ -321,10 +326,10 @@ def map_sage_to_pmsms(
         ).df()
 
         # precursor slice info (one row per precursor_idx)
-        prec = duckdb.sql(
-            f"""
+        prec = con.sql(
+            """
             SELECT precursor_idx, fragment_spectrum_start, fragment_event_cnt, charges
-            FROM read_parquet('{precursors_parquet}')
+            FROM precursors_tbl
             WHERE fragment_event_cnt > 0
             """
         ).df()

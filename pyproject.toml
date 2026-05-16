@@ -21,6 +21,7 @@ dependencies = [
     "plotnine",
     "timstofu",
     "pydantic",
+    "pandas_ops",
 ]
 
 [project.scripts]

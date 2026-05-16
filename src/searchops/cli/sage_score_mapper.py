@@ -421,7 +421,7 @@ if __name__ == "__main__":
     fasta = "human"
 
     __args = dict(
-        precursors=f"temp/{dataset}/{cfg}/filtered_precursor_clusters_with_nontrivial_ms2.parquet",
+        precursors=f"temp/{dataset}/{cfg}/filtered_precursor_clusters_with_nontrivial_ms2.mmappet",
         pmsms=f"temp/{dataset}/{cfg}/pmsms.mmappet",
         mapped_precursors=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/sage_mapped_to_pmsms/precursors.parquet",
         mapping=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/sage_mapped_to_pmsms/mapping.parquet",
