@@ -5,6 +5,8 @@ from typing import Literal
 
 import duckdb
 
+from pandas_ops.io import read_df
+
 QCOL = {"psm": "spectrum_q", "peptide": "peptide_q", "protein": "protein_q"}
 
 
@@ -38,6 +40,41 @@ def summarize_sage(
         source = f"read_csv('{path}', delim='\t', header=true, quote='', ignore_errors=true)"
 
     con.execute(f"CREATE VIEW sage AS SELECT * FROM {source} WHERE {q} <= {fdr}")
+    psm_count = con.execute("SELECT COUNT(*) FROM sage").fetchone()[0]
+    peptide_count = con.execute("SELECT COUNT(DISTINCT peptide) FROM sage").fetchone()[0]
+    ion_count = con.execute(
+        "SELECT COUNT(DISTINCT (peptide, charge)) FROM sage"
+    ).fetchone()[0]
+    protein_count = con.execute("""
+        SELECT COUNT(DISTINCT trim(p))
+        FROM sage, unnest(string_split(proteins, ';')) AS t(p)
+    """).fetchone()[0]
+    return {
+        "psm_count": psm_count,
+        "peptide_count": peptide_count,
+        "ion_count": ion_count,
+        "protein_count": protein_count,
+    }
+
+
+def count_sage_at_fdr(
+    path: str | Path,
+    fdr: float = 0.01,
+    level: Literal["psm", "peptide", "protein"] = "peptide",
+) -> dict[str, int]:
+    """Filter SAGE results at a given FDR threshold and count PSMs/peptides/ions/proteins
+    in one pass, reading via pandas_ops.io.read_df (any format it supports, dispatched on
+    file extension) rather than a hardcoded read_parquet/read_csv call.
+
+    Unlike summarize_sage(), this does not special-case malformed TSV rows (no
+    ignore_errors/quote=''): SAGE's own TSV output is trusted to be well-formed here.
+    """
+    q = QCOL[level]
+    df = read_df(path)
+
+    con = duckdb.connect()
+    con.register("sage_raw", df)
+    con.execute(f"CREATE VIEW sage AS SELECT * FROM sage_raw WHERE {q} <= {fdr}")
     psm_count = con.execute("SELECT COUNT(*) FROM sage").fetchone()[0]
     peptide_count = con.execute("SELECT COUNT(DISTINCT peptide) FROM sage").fetchone()[0]
     ion_count = con.execute(
