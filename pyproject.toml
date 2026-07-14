@@ -35,6 +35,7 @@ sage-pmsms-mapper  = "searchops.cli.sage_pmsms_mapper:main"
 sage_score_mapper  = "searchops.cli.sage_score_mapper:main"
 record-run         = "searchops.cli.record_run:main"
 score-delta-plots  = "searchops.cli.score_delta_plots:main"
+recalibrate-mz     = "searchops.cli.recalibrate_mz:main"
 
 [project.urls]
 homepage   = "https://github.com/MatteoLacki/searchops.git"
