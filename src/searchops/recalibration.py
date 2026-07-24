@@ -14,6 +14,7 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
+from scipy.interpolate import CubicSpline
 
 from pandas_ops.io import read_df
 
@@ -31,9 +32,23 @@ def filter_top_psms(sage_results_tsv: str | Path, fdr: float) -> pd.DataFrame:
 def fit_correction(df: pd.DataFrame, config: dict) -> Callable[[np.ndarray], np.ndarray]:
     """Fit a ppm-error-vs-m/z correction function.
 
-    `config["model"]` selects between `"global_median"` (a single constant) and
-    `"binned_median"` (m/z-binned median, linearly interpolated between bin centers for
-    smoothing) -- a plain if/elif on the string, no dynamic import.
+    `config["model"]` selects between `"global_median"` (a single constant),
+    `"binned_median"` (m/z-binned median, linearly interpolated between bin centers,
+    constant beyond the outermost bins), and `"natural_cubic_spline"` (smoother
+    alternative to `binned_median`'s jagged `np.interp` line) -- a plain if/elif on
+    the string, no dynamic import. Every occupied bin is used as a node regardless of
+    how many PSMs fall in it -- no minimum-count threshold -- since `np.interp`/the
+    spline already hold the value of the nearest node constant past the edges, so a
+    sparsely-populated bin at the edge degrades gracefully instead of needing a
+    separate fallback.
+
+    `"natural_cubic_spline"` bins the same way `binned_median` does (`bin_width_da`),
+    then groups those bins 3-wide (one node per 3 `bin_width_da` bins) and takes the
+    per-group median as a node point. A cubic spline through those nodes is fit with
+    the first derivative clamped to zero at both ends (`bc_type=((1, 0), (1, 0))`),
+    so it flattens smoothly (no kink, unlike a plain clip) into a constant beyond the
+    outermost node -- evaluated by clipping the input m/z into `[node_mz.min(),
+    node_mz.max()]` before calling the spline.
     """
     model = config["model"]
     ppm = df["precursor_ppm"].to_numpy()
@@ -45,16 +60,31 @@ def fit_correction(df: pd.DataFrame, config: dict) -> Callable[[np.ndarray], np.
     if model == "binned_median":
         mz = df["precursor_mz"].to_numpy()
         bin_width = config["bin_width_da"]
-        min_psms_per_bin = config["min_psms_per_bin"]
         bin_idx = np.floor(mz / bin_width).astype(np.int64)
-        stats = pd.DataFrame({"bin": bin_idx, "ppm": ppm}).groupby("bin")["ppm"].agg(["median", "count"])
-        stats = stats[stats["count"] >= min_psms_per_bin].sort_index()
-        if len(stats) < 2:
-            offset = float(np.median(ppm))
-            return lambda mz: np.full_like(np.asarray(mz, dtype=np.float64), offset)
-        bin_centers = (stats.index.to_numpy() + 0.5) * bin_width
-        bin_medians = stats["median"].to_numpy()
-        return lambda mz: np.interp(mz, bin_centers, bin_medians)
+        bin_medians = pd.DataFrame({"bin": bin_idx, "ppm": ppm}).groupby("bin")["ppm"].median().sort_index()
+        bin_centers = (bin_medians.index.to_numpy() + 0.5) * bin_width
+        return lambda mz: np.interp(mz, bin_centers, bin_medians.to_numpy())
+
+    if model == "natural_cubic_spline":
+        mz = df["precursor_mz"].to_numpy()
+        bin_width = config["bin_width_da"]
+        bin_idx = np.floor(mz / bin_width).astype(np.int64)
+        n_bins = len(np.unique(bin_idx))
+        n_knots = max(4, n_bins // 3)
+
+        wide_bin_width = (mz.max() - mz.min()) / n_knots
+        wide_bin_idx = np.floor((mz - mz.min()) / wide_bin_width).astype(np.int64)
+        nodes = (
+            pd.DataFrame({"bin": wide_bin_idx, "mz": mz, "ppm": ppm})
+            .groupby("bin")
+            .median()
+            .sort_values("mz")
+        )
+        node_mz = nodes["mz"].to_numpy()
+        node_ppm = nodes["ppm"].to_numpy()
+        spline = CubicSpline(node_mz, node_ppm, bc_type=((1, 0.0), (1, 0.0)))
+        lo, hi = node_mz.min(), node_mz.max()
+        return lambda mz: spline(np.clip(mz, lo, hi))
 
     raise ValueError(f"unknown recalibration model: {model!r}")
 
@@ -89,16 +119,22 @@ def recalibrate(
     config: dict,
     fdr: float,
 ) -> tuple[np.ndarray, dict]:
-    """Fit the ppm correction from confident PSMs, apply it to the tof2mz lookup array,
-    and derive new precursor_tol/fragment_tol bounds from the (post-correction) residual
-    error distributions' min/max (not a quantile -- a quantile cutoff has no safety
-    margin and was found to shrink Sage's own candidate search space too aggressively,
-    losing far more identifications than the tighter tolerance was worth).
+    """Fit the ppm correction from confident PSMs and apply it to the tof2mz lookup
+    array (fragments only -- see searchops_pandas_dictodot_multigit.md / sage_rescoring.md
+    for why precursor mz needs its own separate correction step, done elsewhere by
+    `recalibrate-precursor-mz`).
 
-    No fragment-specific model is fit -- fragment_tol is tightened using the confident
-    PSMs' own observed (uncorrected) `fragment_ppm` values directly, since tof2mz is a
-    single shared ToF->m/z lookup and recalibrating it improves fragments too even though
-    the correction is only fit from precursor errors.
+    precursor_tol/fragment_tol are both derived from `config["tolerance_percentiles"]`
+    (a user-specified `[lo, hi]` percentile pair) applied to the same distribution: the
+    post-correction residual `precursor_ppm` error. Sage's own `fragment_ppm` cannot be
+    used for this -- it's an intensity-weighted mean of *absolute* ppm error (Sage sums
+    `.abs()` differences, see sage/src/scoring.rs), never signed, so no residual can be
+    recovered from it and any window built from its raw min/max is always one-sided
+    (violates Sage's own tolerance-window convention: the window must contain the
+    negation of the real signed error). Reusing the precursor residual's percentile
+    window for fragment_tol instead rests on the assumption -- not a measurement, since
+    Sage doesn't report signed fragment error -- that fragment ppm error follows the same
+    ToF-calibration-driven trend as precursor ppm error.
     """
     df = filter_top_psms(sage_results_tsv, fdr)
     correction = fit_correction(df, config)
@@ -108,12 +144,12 @@ def recalibrate(
     residual_precursor_ppm = df["precursor_ppm"].to_numpy() - correction(
         df["precursor_mz"].to_numpy()
     )
-    precursor_lo, precursor_hi = residual_precursor_ppm.min(), residual_precursor_ppm.max()
-    fragment_ppm = df["fragment_ppm"].to_numpy()
-    fragment_lo, fragment_hi = fragment_ppm.min(), fragment_ppm.max()
+    lo_pct, hi_pct = config["tolerance_percentiles"]
+    tol_lo = float(np.percentile(residual_precursor_ppm, lo_pct))
+    tol_hi = float(np.percentile(residual_precursor_ppm, hi_pct))
 
     tolerance = {
-        "precursor_tol": {"ppm": [float(precursor_lo), float(precursor_hi)]},
-        "fragment_tol": {"ppm": [float(fragment_lo), float(fragment_hi)]},
+        "precursor_tol": {"ppm": [tol_lo, tol_hi]},
+        "fragment_tol": {"ppm": [tol_lo, tol_hi]},
     }
     return new_tof2mz.astype(np.float32), tolerance
