@@ -29,14 +29,11 @@ dependencies = [
 [project.scripts]
 sage-summary  = "searchops.cli.sage_summary:main"
 sage-write    = "searchops.cli.sage_write:main"
-tsv2parquet    = "searchops.cli.tsv2parquet:main"
 sage-filter    = "searchops.cli.sage_filter:main"
-sage-summarize     = "searchops.cli.sage_summarize:main"
 sage-summarize-raw = "searchops.cli.sage_summarize_raw:main"
 sage-pmsms-mapper  = "searchops.cli.sage_pmsms_mapper:main"
 sage_score_mapper  = "searchops.cli.sage_score_mapper:main"
 record-run         = "searchops.cli.record_run:main"
-score-delta-plots  = "searchops.cli.score_delta_plots:main"
 recalibrate-mz     = "searchops.cli.recalibrate_mz:main"
 recalibrate-precursor-mz = "searchops.cli.recalibrate_precursor_mz:main"
 

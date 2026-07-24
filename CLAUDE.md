@@ -9,8 +9,7 @@ src/searchops/
     ├── sage_summary.py      # sage-summary  — compare results across folders
     ├── sage_write.py        # sage-write    — export single-file summary TSV
     ├── sage_filter.py       # sage-filter   — FDR-filter TSV/parquet → parquet
-    ├── tsv2parquet.py       # tsv2parquet   — convert SAGE TSV → parquet
-    ├── sage_summarize.py    # sage-summarize — count pre-filtered parquet
+    ├── sage_summarize_raw.py # sage-summarize-raw — filter+count raw SAGE results in one pass
     ├── sage_pmsms_mapper.py # sage-pmsms-mapper — map fragments to mmappet library
     └── sage_score_mapper.py # sage_score_mapper — visualise pmsms score distributions
 ```
@@ -19,7 +18,7 @@ src/searchops/
 
 Two exported functions:
 - `summarize_sage(path, fdr, level)` — filters by FDR on the fly; accepts TSV or parquet
-- `count_sage(path)` — counts a pre-filtered parquet (no FDR argument); used by `sage-summarize`
+- `count_sage(path)` — counts a pre-filtered parquet (no FDR argument); used by `sage-summarize-raw`
 
 Filtering levels and their q-value columns:
 
@@ -42,7 +41,7 @@ directly via `read_parquet()` / `read_csv()` — do not load into pandas first.
 **TSV quirk**: SAGE's `scannr` field contains triple-quoted strings with embedded
 newlines. `quote='', ignore_errors=true` in `read_csv` handles this; the rows
 dropped by `ignore_errors` are the malformed ones (scannr only, not PSM data).
-`tsv2parquet` applies the same handling when converting to parquet.
+Every reader of raw SAGE TSV output in this package applies the same handling.
 
 ## `sage-pmsms-mapper` — fragment matching
 
