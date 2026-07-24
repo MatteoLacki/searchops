@@ -267,6 +267,7 @@ def map_sage_to_pmsms(
     con = duckdb.connect()
     prec_df = read_df(precursors_parquet)
     con.register("precursors_tbl", prec_df)
+    con.register("matched_tbl", read_df(matched_fragments))
 
     if use_duckdb:
         # One row per matched fragment, sorted by precursor_idx, with original
@@ -278,7 +279,7 @@ def map_sage_to_pmsms(
                     row_number() OVER () - 1          AS sage_fragment_idx,
                     psm_id,
                     fragment_mz_experimental
-                FROM read_parquet('{matched_fragments}')
+                FROM matched_tbl
             ),
             psm_map AS (
                 SELECT
@@ -304,13 +305,13 @@ def map_sage_to_pmsms(
         ).df()
     else:
         # per matched fragment with original file row index
-        raw = duckdb.sql(
-            f"""
+        raw = con.sql(
+            """
             SELECT
                 row_number() OVER () - 1  AS sage_fragment_idx,
                 psm_id,
                 fragment_mz_experimental
-            FROM read_parquet('{matched_fragments}')
+            FROM matched_tbl
             """
         ).df()
 

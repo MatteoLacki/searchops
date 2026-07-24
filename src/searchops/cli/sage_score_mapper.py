@@ -749,7 +749,7 @@ def compare_scores(
     # ── 1. Open files ─────────────────────────────────────────────────────────
     with open(config, "rb") as fh:
         cfg = tomllib.load(fh)
-    pmsms_cfg = cfg["pseudomsms"]
+    pmsms_cfg = cfg.get("pseudomsms", cfg)
     score_method = pmsms_cfg["tofs_extraction_method"]
     if score_method == "score":
         params = pmsms_cfg.get("tofs_extraction_params", {})
