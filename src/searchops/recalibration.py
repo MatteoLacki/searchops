@@ -34,7 +34,18 @@ def filter_top_psms(sage_results_tsv: str | Path, fdr: float) -> pd.DataFrame:
     return df
 
 
-def fit_correction(df: pd.DataFrame, config: dict) -> Callable[[np.ndarray], np.ndarray]:
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Weighted median: smallest value where cumulative weight reaches half the total."""
+    order = np.argsort(values)
+    values, weights = values[order], weights[order]
+    cutoff = weights.sum() / 2.0
+    cumulative = np.cumsum(weights)
+    return float(values[np.searchsorted(cumulative, cutoff)])
+
+
+def fit_correction(
+    df: pd.DataFrame, config: dict, weights: np.ndarray | None = None,
+) -> Callable[[np.ndarray], np.ndarray]:
     """Fit a ppm-error-vs-m/z correction function.
 
     `config["model"]` selects between `"global_median"` (a single constant),
@@ -54,19 +65,34 @@ def fit_correction(df: pd.DataFrame, config: dict) -> Callable[[np.ndarray], np.
     so it flattens smoothly (no kink, unlike a plain clip) into a constant beyond the
     outermost node -- evaluated by clipping the input m/z into `[node_mz.min(),
     node_mz.max()]` before calling the spline.
+
+    `weights` (optional, one entry per `df` row, e.g. a selection strategy's
+    per-survivor neighborhood density) turns every per-node/global `ppm` median above
+    into a weighted median instead -- node/bin *placement* (`bin_centers`/`node_mz`)
+    stays an unweighted median of `precursor_mz`, only the fitted `ppm` value at each
+    node is reweighted. Omitted (default `None`) reproduces today's unweighted
+    behavior exactly, so existing callers (e.g. `recalibrate()`) are unaffected.
     """
     model = config["model"]
     ppm = df["precursor_ppm"].to_numpy()
 
     if model == "global_median":
-        offset = float(np.median(ppm))
+        offset = float(np.median(ppm)) if weights is None else _weighted_median(ppm, weights)
         return lambda mz: np.full_like(np.asarray(mz, dtype=np.float64), offset)
 
     if model == "binned_median":
         mz = df["precursor_mz"].to_numpy()
         bin_width = config["bin_width_da"]
         bin_idx = np.floor(mz / bin_width).astype(np.int64)
-        bin_medians = pd.DataFrame({"bin": bin_idx, "ppm": ppm}).groupby("bin")["ppm"].median().sort_index()
+        if weights is None:
+            bin_medians = pd.DataFrame({"bin": bin_idx, "ppm": ppm}).groupby("bin")["ppm"].median().sort_index()
+        else:
+            bin_medians = (
+                pd.DataFrame({"bin": bin_idx, "ppm": ppm, "weight": weights})
+                .groupby("bin")
+                .apply(lambda g: _weighted_median(g["ppm"].to_numpy(), g["weight"].to_numpy()))
+                .sort_index()
+            )
         bin_centers = (bin_medians.index.to_numpy() + 0.5) * bin_width
         return lambda mz: np.interp(mz, bin_centers, bin_medians.to_numpy())
 
@@ -79,12 +105,21 @@ def fit_correction(df: pd.DataFrame, config: dict) -> Callable[[np.ndarray], np.
 
         wide_bin_width = (mz.max() - mz.min()) / n_knots
         wide_bin_idx = np.floor((mz - mz.min()) / wide_bin_width).astype(np.int64)
-        nodes = (
-            pd.DataFrame({"bin": wide_bin_idx, "mz": mz, "ppm": ppm})
-            .groupby("bin")
-            .median()
-            .sort_values("mz")
-        )
+        if weights is None:
+            nodes = (
+                pd.DataFrame({"bin": wide_bin_idx, "mz": mz, "ppm": ppm})
+                .groupby("bin")
+                .median()
+                .sort_values("mz")
+            )
+        else:
+            grouped = pd.DataFrame(
+                {"bin": wide_bin_idx, "mz": mz, "ppm": ppm, "weight": weights}
+            ).groupby("bin")
+            nodes = pd.DataFrame({
+                "mz": grouped["mz"].median(),
+                "ppm": grouped.apply(lambda g: _weighted_median(g["ppm"].to_numpy(), g["weight"].to_numpy())),
+            }).sort_values("mz")
         node_mz = nodes["mz"].to_numpy()
         node_ppm = nodes["ppm"].to_numpy()
         spline = CubicSpline(node_mz, node_ppm, bc_type=((1, 0.0), (1, 0.0)))
