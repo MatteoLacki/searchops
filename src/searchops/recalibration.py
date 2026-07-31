@@ -22,9 +22,14 @@ PROTON_MASS = 1.00727646688
 
 
 def filter_top_psms(sage_results_tsv: str | Path, fdr: float) -> pd.DataFrame:
-    """Top-ranked, FDR-confident PSMs, with a `precursor_mz` column added."""
+    """Top-ranked, FDR-confident, target-only PSMs, with a `precursor_mz` column added.
+
+    `peptide_q <= fdr` alone lets a handful of decoys (`label == -1`) through near the
+    threshold, since target-decoy competition doesn't guarantee every sub-threshold row
+    is a target -- exclude them explicitly rather than relying on the q-value cutoff.
+    """
     df = read_df(sage_results_tsv)
-    df = df[(df["rank"] == 1) & (df["peptide_q"] <= fdr)].copy()
+    df = df[(df["rank"] == 1) & (df["peptide_q"] <= fdr) & (df["label"] == 1)].copy()
     df["precursor_mz"] = df["expmass"] / df["charge"] + PROTON_MASS
     return df
 
