@@ -1,10 +1,9 @@
 """Fit and apply a precursor m/z recalibration from confident SAGE PSMs.
 
-Sage's own `precursor_ppm` column is `feature.delta_mass` in sage-core's
-`scoring.rs` (`(expmass - calcmass - isotope_error) * 2e6 / (expmass - isotope_error +
-calcmass)`): positive when the observed/experimental mass is *heavier* than the
-theoretical mass. So correcting a tof2mz-derived m/z means *dividing* by
-`(1 + ppm/1e6)`, not adding it.
+Sage's `precursor_ppm` (`feature.delta_mass` in sage-core's `scoring.rs`:
+`(expmass - calcmass - isotope_error) * 2e6 / (expmass - isotope_error + calcmass)`)
+is positive when the observed mass is heavier than theoretical -- so correcting a
+tof2mz-derived m/z means *dividing* by `(1 + ppm/1e6)`, not adding it.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import pandas as pd
 from scipy.interpolate import BSpline, CubicSpline
 from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import spsolve
-from xgboost import XGBRegressor
+from xgboost import DMatrix, XGBRegressor
 
 from pandas_ops.io import read_df
 
@@ -28,9 +27,9 @@ PROTON_MASS = 1.00727646688
 def filter_top_psms(sage_results_tsv: str | Path, fdr: float) -> pd.DataFrame:
     """Top-ranked, FDR-confident, target-only PSMs, with a `precursor_mz` column added.
 
-    `peptide_q <= fdr` alone lets a handful of decoys (`label == -1`) through near the
-    threshold, since target-decoy competition doesn't guarantee every sub-threshold row
-    is a target -- exclude them explicitly rather than relying on the q-value cutoff.
+    `peptide_q <= fdr` alone lets a few decoys through near the threshold (target-decoy
+    competition doesn't guarantee every sub-threshold row is a target), so `label == 1`
+    is checked explicitly too.
     """
     df = read_df(sage_results_tsv)
     df = df[(df["rank"] == 1) & (df["peptide_q"] <= fdr) & (df["label"] == 1)].copy()
@@ -54,9 +53,9 @@ def _confident_matched_fragments(
     matched_fragments: str | Path, confident_psm_ids: pd.Series,
 ) -> pd.DataFrame:
     """Matched fragments belonging to confident PSMs, with a signed `fragment_ppm`
-    column added. Sage's own per-PSM `fragment_ppm` (in `results.sage.tsv`) is an
-    intensity-weighted mean of *absolute* ppm error and cannot be used for a residual
-    -- `matched_fragments.sage.tsv`'s per-fragment `fragment_mz_calculated`/
+    column added. Sage's per-PSM `fragment_ppm` (in `results.sage.tsv`) is an
+    intensity-weighted mean of *absolute* error and can't be used as a residual --
+    `matched_fragments.sage.tsv`'s per-fragment `fragment_mz_calculated`/
     `fragment_mz_experimental` gives a genuine signed value instead.
     """
     fragments = read_df(matched_fragments)
@@ -80,18 +79,14 @@ def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
 def _derivative_penalized_smooth(
     y: np.ndarray, weight: np.ndarray, lam1: float, lam2: float = 0.0,
 ) -> np.ndarray:
-    """Weighted Whittaker/P-spline smoother: minimize
-    `sum(w_i (f_i - y_i)^2) + lam1 * sum((f_{i+1} - f_i)^2)
-    + lam2 * sum((f_{i+1} - 2 f_i + f_{i-1})^2)` over `f`, closed-form via a banded
-    solve -- `lam1` penalizes the discrete first derivative (large slope changes
-    between neighbors), `lam2` the discrete second derivative (curvature/oscillation).
-    A first-derivative-only smoother can still oscillate wildly between sparse/noisy
-    nodes (each segment is free to swing independently, as long as consecutive slopes
-    aren't individually large) -- the second-derivative term additionally penalizes
-    *changes* in slope, which is what actually suppresses that oscillation. Both
-    default-compatible: `lam1=0, lam2=0` reproduces `y` exactly; `lam2=0` alone
-    reproduces the original order-1-only smoother. Assumes `y`/`weight` are already
-    ordered along the axis the penalty applies to (e.g. node index by increasing m/z).
+    """Weighted Whittaker/P-spline smoother: minimizes `sum(w_i (f_i-y_i)^2) + lam1 *
+    sum((f_{i+1}-f_i)^2) + lam2 * sum((f_{i+1}-2f_i+f_{i-1})^2)` over `f`, via a
+    banded solve. `lam1` penalizes slope changes between neighbors (first
+    derivative); `lam2` penalizes curvature (second derivative) -- needed because a
+    first-derivative-only penalty still lets segments swing independently between
+    sparse/noisy nodes, as long as no single slope is individually large.
+    `lam1=lam2=0` reproduces `y` exactly. Assumes `y`/`weight` are already ordered
+    along the penalty axis (e.g. node index by increasing m/z).
     """
     n = len(y)
     D1 = diags([-np.ones(n - 1), np.ones(n - 1)], offsets=[0, 1], shape=(n - 1, n))
@@ -109,22 +104,20 @@ def _fit_pspline(
     mz: np.ndarray, ppm: np.ndarray, weight: np.ndarray,
     bin_width_da: float, lam1: float, lam2: float, degree: int = 3,
 ) -> Callable[[np.ndarray], np.ndarray]:
-    """Penalized B-spline (P-spline, Eilers & Marx 1996) regression: fit B-spline
-    basis coefficients by penalized weighted least squares, penalizing first- and
-    second-order differences between *adjacent coefficients* -- not raw data, unlike
-    `_derivative_penalized_smooth` -- so the result stays a genuine smooth spline
-    (continuous up to the `degree`-1 derivative) throughout, instead of a penalized
-    set of node values connected by straight lines. Interior knots are placed evenly
-    every `bin_width_da` -- dense, per the P-spline recipe, since the penalty (not
-    knot placement) is what does the smoothing, avoiding the sparse/noisy-node
-    oscillation a `natural_cubic_spline` (an exact interpolant, no penalty at all)
-    can show.
+    """Penalized B-spline (P-spline, Eilers & Marx 1996): fit B-spline coefficients
+    by penalized weighted least squares, penalizing first/second differences between
+    *adjacent coefficients* (not raw data, unlike `_derivative_penalized_smooth`) --
+    so the result is a genuine C(`degree`-1)-continuous spline, not a penalized set
+    of node values joined by straight lines. Interior knots are dense (every
+    `bin_width_da`), since the penalty rather than knot placement does the
+    smoothing, avoiding the sparse/noisy-node oscillation an unpenalized exact
+    interpolant (`natural_cubic_spline`) can show.
 
-    Boundary knots are clamped (`degree + 1` repeats), and the first two and last two
-    basis coefficients are tied together -- for a clamped B-spline, `f'(boundary)` is
-    exactly proportional to the difference between its two boundary coefficients, so
-    tying them forces a flat (zero first-derivative) approach at both ends without
-    pinning the curve to any particular boundary *value*.
+    Boundary knots are clamped, and the first two / last two basis coefficients are
+    each tied together -- for a clamped B-spline, `f'(boundary)` is proportional to
+    the difference between its two boundary coefficients, so tying them forces a
+    flat (zero first-derivative) approach at both ends without pinning the curve to
+    a specific boundary value.
     """
     lo, hi = float(mz.min()), float(mz.max())
     n_interior = max(1, int(np.ceil((hi - lo) / bin_width_da)) - 1)
@@ -165,65 +158,53 @@ def fit_correction(
 ) -> Callable[[np.ndarray], np.ndarray]:
     """Fit a ppm-error-vs-m/z correction function.
 
-    `config["model"]` selects between `"global_median"` (a single constant),
-    `"binned_median"` (m/z-binned median, linearly interpolated between bin centers,
-    constant beyond the outermost bins), `"pspline_derivative_penalized"` (see
-    below), `"natural_cubic_spline"` (smoother alternative to `binned_median`'s
-    jagged `np.interp` line, but exact-interpolating and prone to Runge's-phenomenon
-    -style oscillation between sparse/noisy nodes -- see
-    `"pspline_derivative_penalized"` for a non-oscillating alternative), and
-    `"xgboost_derivative_penalized"` (see below) -- a plain if/elif on the string, no
-    dynamic import. Every occupied bin is used as a node regardless of how many PSMs
-    fall in it -- no minimum-count threshold -- since `np.interp`/the spline already
-    hold the value of the nearest node constant past the edges, so a
-    sparsely-populated bin at the edge degrades gracefully instead of needing a
-    separate fallback.
+    `config["model"]` (plain if/elif, no dynamic import) selects between:
+    - `"global_median"`: a single constant.
+    - `"binned_median"`: m/z-binned median, `np.interp`-ed between bin centers,
+      constant beyond the outermost bins.
+    - `"pspline_derivative_penalized"`: see below.
+    - `"natural_cubic_spline"`: smoother than `binned_median`'s jagged line, but an
+      exact interpolant prone to Runge's-phenomenon oscillation between sparse/noisy
+      nodes -- see `"pspline_derivative_penalized"` for a non-oscillating alternative.
+    - `"xgboost_derivative_penalized"`: see below.
 
-    `"pspline_derivative_penalized"` (`_fit_pspline`) fits a genuine penalized B-spline
-    (P-spline) directly on the raw (not binned-median) data: dense interior knots
-    every `bin_width_da`, `config["lam1"]`/`config["lam2"]` (both default `0.0`)
-    penalizing first/second differences between adjacent B-spline coefficients, and
-    the two boundary coefficient pairs tied together so the curve flattens (zero
-    first derivative, not necessarily zero value) at both ends. Unlike
-    `"natural_cubic_spline"` (an exact interpolant with no penalty at all) this
-    doesn't oscillate between sparse/noisy nodes (e.g. a pooled precursor+fragment
-    fit, where fragments extend well past the precursor m/z range into sparser
-    territory), while staying a true smooth spline throughout -- unlike
-    `_derivative_penalized_smooth`-based approaches, which penalize discrete *node
-    values* and connect them with straight lines (only C0 continuous, visible kinks
-    at bin boundaries), this penalizes spline *coefficients*, so the result is C2
-    continuous everywhere, no kinks.
+    Every occupied bin is used as a node regardless of count -- no minimum-count
+    threshold -- since `np.interp`/the spline already hold the nearest node's value
+    constant past the edges, so a sparse edge bin degrades gracefully.
 
-    `"natural_cubic_spline"` bins the same way `binned_median` does (`bin_width_da`),
-    then groups those bins 3-wide (one node per 3 `bin_width_da` bins) and takes the
-    per-group median as a node point. A cubic spline through those nodes is fit with
-    the first derivative clamped to zero at both ends (`bc_type=((1, 0), (1, 0))`),
-    so it flattens smoothly (no kink, unlike a plain clip) into a constant beyond the
-    outermost node -- evaluated by clipping the input m/z into `[node_mz.min(),
-    node_mz.max()]` before calling the spline. Nothing constrains the curve *between*
-    nodes, though, so uneven/sparse node spacing can make it swing wildly well inside
-    the fitted range, not just at the clipped boundary.
+    `"pspline_derivative_penalized"` (`_fit_pspline`) fits a genuine penalized
+    B-spline directly on the raw (not binned-median) data: dense interior knots
+    every `bin_width_da`, `config["lam1"]`/`config["lam2"]` (default `0.0`)
+    penalizing first/second differences between adjacent coefficients, boundary
+    coefficient pairs tied so the curve flattens (zero first derivative) at both
+    ends. Unlike `"natural_cubic_spline"` this doesn't oscillate between
+    sparse/noisy nodes (e.g. a pooled precursor+fragment fit, where fragments extend
+    well past the precursor m/z range) while staying C2-continuous throughout --
+    unlike `_derivative_penalized_smooth`-based approaches, which penalize discrete
+    node values joined by straight lines (only C0, visible kinks), this penalizes
+    spline coefficients directly.
 
-    `"xgboost_derivative_penalized"` bins the same way `binned_median` does
-    (`bin_width_da`), but each node's y-value is an `XGBRegressor` prediction at the
-    bin center -- fit once on every row, not per-bin -- rather than a plain per-bin
-    median, so the node values can capture nonlinear structure a median can't. Those
-    predicted node values are then smoothed by `_derivative_penalized_smooth`
-    (`config["lam"]`, weighted by bin occupancy) before `np.interp`, since an
-    unconstrained per-bin xgboost prediction can be as jagged as `binned_median`'s
-    raw median -- the derivative penalty is what keeps the fitted curve smooth
-    despite xgboost's flexibility. `config["xgboost_kwargs"]` (optional dict)
-    overrides `XGBRegressor`'s defaults (`n_estimators=200, max_depth=3,
-    learning_rate=0.05, reg_lambda=1.0`).
+    `"natural_cubic_spline"` bins like `binned_median` (`bin_width_da`), groups bins
+    3-wide, takes each group's median as a node, then fits a cubic spline through
+    those nodes with the first derivative clamped to zero at both ends (flattens
+    smoothly beyond the outermost node, evaluated by clipping input m/z into the
+    node range first). Nothing constrains the curve *between* nodes, so
+    uneven/sparse spacing can make it swing wildly well inside the fitted range.
 
-    `weights` (optional, one entry per `df` row, e.g. a selection strategy's
-    per-survivor neighborhood density) turns every per-node/global `ppm` median above
-    into a weighted median instead (and feeds `XGBRegressor.fit`'s `sample_weight`
-    for `xgboost_derivative_penalized`) -- node/bin *placement* (`bin_centers`/
-    `node_mz`) stays an unweighted median of `precursor_mz`, only the fitted `ppm`
-    value at each node is reweighted. Omitted (default `None`) reproduces today's
-    unweighted behavior exactly, so existing callers (e.g. `recalibrate()`) are
-    unaffected.
+    `"xgboost_derivative_penalized"` bins like `binned_median`, but each node's
+    y-value is an `XGBRegressor` prediction at the bin center (fit once on every
+    row, not per-bin) rather than a plain median, so nodes can capture nonlinear
+    structure a median can't. Those predicted nodes are then smoothed by
+    `_derivative_penalized_smooth` (`config["lam"]`, weighted by bin occupancy)
+    before `np.interp` -- the derivative penalty is what keeps the curve smooth
+    despite xgboost's flexibility. `config["xgboost_kwargs"]` overrides
+    `XGBRegressor`'s defaults (`n_estimators=200, max_depth=3, learning_rate=0.05,
+    reg_lambda=1.0`).
+
+    `weights` (optional, one entry per `df` row) turns every median above into a
+    weighted median (and feeds `XGBRegressor.fit`'s `sample_weight`) -- node/bin
+    *placement* stays an unweighted median of `precursor_mz`, only the fitted `ppm`
+    value is reweighted. `None` (default) reproduces the unweighted behavior exactly.
     """
     model = config["model"]
     ppm = df["precursor_ppm"].to_numpy()
@@ -312,29 +293,146 @@ def fit_correction(
     raise ValueError(f"unknown recalibration model: {model!r}")
 
 
-if False:
-    # Interactive/dev block: paste into ipython to inspect recalibrate()'s inner
-    # workings on real data. Populated by `jobs/inspect_recalibrate.toml`
-    # (`./nf jobs/inspect_recalibrate.toml`), which materializes exactly these three
-    # files into results/inspect_recalibrate/ -- rerun that job if the paths below
-    # 404, or point them at a different results/<job>/ folder.
-    import tomllib
-    from timstofu.binary.array_serialization import load_from_folder
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.max_rows", 5)
+def fit_additive_correction(
+    df: pd.DataFrame,
+    dims: list[str],
+    target: str,
+    config: dict,
+    weights: np.ndarray | None = None,
+) -> tuple[dict[str, Callable[[np.ndarray], np.ndarray]], float]:
+    """Multi-dimensional generalization of `fit_correction()`: a GAM-style additive
+    model `target ~= f_1(dims[0]) + f_2(dims[1]) + ...` (e.g. ppm error as a function
+    of m/z, ion mobility, and retention time at once) instead of `fit_correction`'s
+    m/z-only fit. Wholly new, additive-only function -- `fit_correction()`'s contract
+    and call sites are untouched.
 
+    Returns `(components, bias)`: `components` has one plain, non-numba
+    `Callable[[np.ndarray], np.ndarray]` per entry of `dims` (same contract as
+    `_fit_pspline`'s return value), not a single combined callable; `bias` is the
+    constant term common to the whole fit, kept as a plain `float` rather than
+    folded into one component, since it isn't a function of anything. Reconstruct
+    via `bias + sum(components[d](x_d) for d, x_d in zip(dims, columns))`. Each
+    component drops unmodified into `to_numba_correction(component, dim_lo, dim_hi,
+    n_grid)` (summing/numba-wiring across dims is separate, later work).
 
-    _results_dir = Path("results/inspect_recalibrate")
-    sage_results_tsv = _results_dir / "filtered_sage_results_tsv/results.sage.tsv"
-    tof2mz = load_from_folder(_results_dir / "tof2mz/tof2mz.mmappet")
-    with open(_results_dir / "recalibration_config/recalibration_config.toml", "rb") as _f:
-        config = tomllib.load(_f)
-    fdr = 0.01
+    `config["model"]`:
 
-    # step through recalibrate()'s body from here, e.g.:
-    df = filter_top_psms(sage_results_tsv, fdr)
-    correction = fit_correction(df, config)
-    new_tof2mz = tof2mz / (1.0 + correction(tof2mz) * 1e-6)
+    `"xgboost_additive"`: a single `XGBRegressor` with `max_depth` forced to `1`
+    across all `dims` -- depth-1 trees split on exactly one feature each, so the
+    ensemble sum is an *exact* additive decomposition (zero cross-terms) via
+    TreeSHAP (`booster.predict(DMatrix(...), pred_contribs=True)`; spot-checked to
+    ~1e-6 reconstruction error). Each component is a closure that builds a synthetic
+    grid (that dimension varying, every other held at its training-data median --
+    irrelevant to a depth-1 split on this dimension, so the placeholder only affects
+    robustness, not correctness) and reads off that dimension's SHAP column. Bias is
+    returned unfolded. `config["xgboost_kwargs"]` overrides the defaults
+    (`n_estimators=1200, learning_rate=0.03, subsample=0.8, reg_lambda=2.0` -- depth-1
+    trees need far more of them than `xgboost_derivative_penalized`'s depth-3
+    default); an explicit `max_depth != 1` raises `ValueError` rather than silently
+    breaking the additivity guarantee. No internal train/valid split or early
+    stopping -- a single fixed-round fit, fine for test-only/not-yet-pipeline-wired.
+
+    `"pspline_additive"`: classical Gauss-Seidel backfitting using `_fit_pspline` as
+    the per-dimension smoother, `config.get("backfit_iters", 15)` passes over `dims`,
+    one shared `bin_width_da`/`lam1`/`lam2`/`degree` across all dimensions (no
+    per-dim hyperparameters yet). `intercept` is fixed up front as the weighted mean
+    of `target`; each round, each dimension refits against the partial residual
+    (`target` minus intercept minus every *other* dimension's current fit) and
+    re-centers to weighted-mean zero -- additive models are identifiable only up to
+    constants that shift between components while cancelling in the sum, so without
+    re-centering the components would drift instead of converging. `intercept` is
+    returned as `bias`. Fixed iteration count, no convergence check -- a
+    max-abs-change early exit would be a trivial future addition.
+
+    `weights` (optional, one entry per `df` row) mirrors `fit_correction`'s own:
+    `None` means unweighted; otherwise it feeds `XGBRegressor.fit`'s `sample_weight`
+    or every weighted-mean/`_fit_pspline` call in the pspline branch.
+    """
+    if not dims:
+        raise ValueError("dims must be non-empty")
+    model = config["model"]
+    y = df[target].to_numpy(dtype=np.float64)
+    weight = np.ones_like(y) if weights is None else np.asarray(weights, dtype=np.float64)
+
+    if model == "xgboost_additive":
+        user_kwargs = config.get("xgboost_kwargs", {})
+        if "max_depth" in user_kwargs and user_kwargs["max_depth"] != 1:
+            raise ValueError(
+                "xgboost_additive requires max_depth=1 for the additive-decomposition "
+                f"guarantee to hold; got xgboost_kwargs['max_depth']={user_kwargs['max_depth']!r}"
+            )
+        xgb_kwargs = {
+            "n_estimators": 1200,
+            "learning_rate": 0.03,
+            "subsample": 0.8,
+            "reg_lambda": 2.0,
+            **user_kwargs,
+            "max_depth": 1,  # forced: see docstring
+        }
+
+        # A DataFrame (not a raw ndarray) so real column names attach to the
+        # booster -- needed so the later `DMatrix(grid_df)` predict-contribs calls
+        # don't hit a feature-names mismatch against anonymous f0/f1/... names.
+        feature_df = df[dims].astype(np.float64)
+        regressor = XGBRegressor(**xgb_kwargs)
+        regressor.fit(feature_df, y, sample_weight=weights)
+        booster = regressor.get_booster()
+
+        medians = {d: float(df[d].median()) for d in dims}
+        train_contribs = booster.predict(DMatrix(feature_df), pred_contribs=True)
+        bias = float(np.mean(train_contribs[:, -1]))  # row-invariant base-score term
+
+        def _make_component(dim_index: int, dim_name: str) -> Callable[[np.ndarray], np.ndarray]:
+            def component(x: np.ndarray) -> np.ndarray:
+                x = np.asarray(x, dtype=np.float64)
+                grid = np.empty((x.shape[0], len(dims)), dtype=np.float64)
+                for k, other in enumerate(dims):
+                    grid[:, k] = x if other == dim_name else medians[other]
+                grid_df = pd.DataFrame(grid, columns=dims)
+                contribs = booster.predict(DMatrix(grid_df), pred_contribs=True)
+                return contribs[:, dim_index]
+            return component
+
+        components = {d: _make_component(j, d) for j, d in enumerate(dims)}
+        return components, bias
+
+    if model == "pspline_additive":
+        bin_width_da = config["bin_width_da"]
+        lam1 = config.get("lam1", 0.0)
+        lam2 = config.get("lam2", 0.0)
+        degree = config.get("degree", 3)
+        n_iters = config.get("backfit_iters", 15)
+        if n_iters < 1:
+            raise ValueError(f"backfit_iters must be >= 1, got {n_iters!r}")
+
+        columns = {d: df[d].to_numpy(dtype=np.float64) for d in dims}
+        intercept = float(np.average(y, weights=weight))
+        fitted_values = {d: np.zeros(len(y), dtype=np.float64) for d in dims}
+        components: dict[str, Callable[[np.ndarray], np.ndarray]] = {}
+
+        for _ in range(n_iters):
+            for d in dims:
+                others_sum = np.zeros(len(y), dtype=np.float64)
+                for other in dims:
+                    if other != d:
+                        others_sum += fitted_values[other]
+                partial_residual = y - intercept - others_sum
+                raw_component = _fit_pspline(
+                    columns[d], partial_residual, weight, bin_width_da, lam1, lam2, degree
+                )
+                raw_values = raw_component(columns[d])
+                mean_d = float(np.average(raw_values, weights=weight))
+                fitted_values[d] = raw_values - mean_d
+                # f/delta default args (not a closure over the loop variables by
+                # reference) so each dimension's lambda keeps its own round's
+                # values, not whatever raw_component/mean_d end up as after the
+                # loop finishes (the classic late-binding closure bug).
+                components[d] = lambda x, f=raw_component, delta=mean_d: f(x) - delta
+
+        return components, intercept
+
+    raise ValueError(f"unknown additive recalibration model: {model!r}")
+
 
 def _plot_recalibration_fit(
     plot_path: str | Path,
@@ -346,12 +444,10 @@ def _plot_recalibration_fit(
     fragment_correction: Callable[[np.ndarray], np.ndarray],
     config: dict,
 ) -> None:
-    """Scatter both precursor and fragment ppm-error clouds (still the 1D case --
-    every current model regresses ppm against m/z alone; a model using more
-    dimensions would need a scatterplot-matrix instead, not built since nothing uses
-    more than one dimension yet) plus each type's own fitted trendline. When
-    `fit_separately` is off, `precursor_correction`/`fragment_correction` are the
-    same object (see `recalibrate()`) so the two lines coincide."""
+    """Scatter both precursor and fragment ppm-error clouds plus each type's own
+    fitted trendline (still 1D -- every current model regresses ppm against m/z
+    alone). When `fit_separately` is off, `precursor_correction`/`fragment_correction`
+    are the same object (see `recalibrate()`) so the two lines coincide."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -403,34 +499,28 @@ def to_numba_correction(
 ) -> Callable[[float], float]:
     """Distill any `fit_correction()`-style closure into a numba `@njit` scalar
     function, callable directly from other numba-compiled (including
-    `@njit(parallel=True)`/`prange`) code -- none of `CubicSpline`/`BSpline`/
-    `XGBRegressor` (used internally by various models) are numba-callable
-    themselves, but every model already reduces to a plain array-in-array-out
-    function, so sampling it on a dense grid and distilling that into a lookup
-    table works uniformly regardless of which model produced it.
+    `parallel=True`/`prange`) code -- none of `CubicSpline`/`BSpline`/`XGBRegressor`
+    are numba-callable themselves, but every model reduces to a plain
+    array-in-array-out function, so sampling it on a dense grid into a lookup table
+    works uniformly regardless of which model produced it.
 
-    Deliberately *not* `np.interp` (which does an O(log n) binary search per
-    call): `breakpoints` is evenly spaced by construction, so the containing
-    interval is a single O(1) division, no search needed -- ~35-40x faster in
-    practice than an equivalent numba `np.interp` call, benchmarked on this
-    exact use case.
+    Deliberately *not* `np.interp` (an O(log n) binary search per call):
+    `breakpoints` is evenly spaced by construction, so the containing interval is a
+    single O(1) division -- ~35-40x faster in practice, benchmarked on this exact
+    use case.
 
-    `breakpoints`/`values` are baked in via closure (not passed as explicit
-    arguments) so the call site is just `corrector(mz)` -- simpler than a
-    (function, args) pair, at the cost of each call to `to_numba_correction`
-    triggering its own fresh one-time JIT compile (no `cache=True`: a closure
-    over array freevars can't be meaningfully reused across process restarts
-    the way a plain function with array arguments could be). That one-time
-    compile per fitted model is the normal numba usage pattern regardless
-    (compile once, apply to many values afterward).
+    `breakpoints`/`values` are baked in via closure so the call site is just
+    `corrector(mz)`, at the cost of a fresh one-time JIT compile per call (no
+    `cache=True`: a closure over array freevars can't be meaningfully cached across
+    process restarts) -- the normal numba usage pattern regardless (compile once,
+    apply to many values after).
 
-    `mz_lo`/`mz_hi` should cover the full range this correction will ever be
-    queried at, not just the range it was fit on -- e.g. in `recalibrate()`,
-    that's the union of the fitting data's own m/z range and the full `tof2mz`
-    lookup table's range, since the latter can extend further. Whatever
-    `correction` itself does beyond its own fitted range (hold constant, taper
-    to flat, etc.) carries through automatically, since `values` is produced by
-    calling the original `correction` on the grid, not reimplemented here.
+    `mz_lo`/`mz_hi` should cover the full range this will ever be queried at, not
+    just the range it was fit on -- e.g. in `recalibrate()`, the union of the
+    fitting data's own m/z range and the full `tof2mz` lookup table's range, since
+    the latter can extend further. Whatever `correction` does beyond its own fitted
+    range (hold constant, taper flat, etc.) carries through automatically, since
+    `values` comes from calling `correction` on the grid, not reimplemented here.
     """
     breakpoints = np.linspace(mz_lo, mz_hi, n_grid)
     values = np.asarray(correction(breakpoints), dtype=np.float64)
@@ -454,10 +544,10 @@ def to_numba_correction(
 
 @numba.njit(parallel=True, nogil=True)
 def _apply_numba_correction(mz_array: np.ndarray, corrector) -> np.ndarray:
-    """Apply a `to_numba_correction()`-produced scalar corrector to a whole array,
-    in parallel -- used internally wherever `recalibrate()` needs array-in-array-out
-    behavior (residuals, `tof2mz`, the diagnostic plot); the scalar `corrector`
-    itself is what's meant for embedding directly in other multithreaded numba code.
+    """Apply a `to_numba_correction()` scalar corrector to a whole array, in
+    parallel -- used wherever `recalibrate()` needs array-in-array-out behavior
+    (residuals, `tof2mz`, the plot); the scalar `corrector` itself is what's meant
+    for embedding directly in other multithreaded numba code.
     """
     out = np.empty(mz_array.shape, dtype=np.float64)
     for i in numba.prange(mz_array.shape[0]):
@@ -474,36 +564,29 @@ def recalibrate(
     plot_path: str | Path | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Fit the ppm correction from confident PSMs and apply it to the tof2mz lookup
-    array (fragments only -- see searchops_pandas_dictodot_multigit.md / sage_rescoring.md
-    for why precursor mz needs its own separate correction step, done elsewhere by
-    `recalibrate-precursor-mz`).
+    array (fragments only -- precursor mz gets its own separate correction step,
+    done elsewhere by `recalibrate-precursor-mz`).
 
-    By default one `fit_correction` model is fit directly on precursor and fragment
-    (mz, ppm) data pooled together, with no per-type adjustment at all -- fragment
-    residuals via `matched_fragments.sage.tsv`'s `fragment_mz_experimental`/
-    `fragment_mz_calculated`, since Sage's own per-PSM `fragment_ppm` is an
-    intensity-weighted mean of *absolute* error and cannot give a signed residual.
-    Pooling (rather than fitting on precursor m/z alone and evaluating on fragments'
-    much wider range, as an earlier version of this function did) means the fit's
-    domain spans the *union* of precursor and fragment m/z, so it doesn't silently
-    extrapolate past its own training range.
+    By default one `fit_correction` model is fit on precursor and fragment (mz,
+    ppm) data pooled together -- fragment residuals via `matched_fragments.sage.tsv`'s
+    `fragment_mz_experimental`/`fragment_mz_calculated`, since Sage's own per-PSM
+    `fragment_ppm` is an intensity-weighted mean of *absolute* error and can't give
+    a signed residual. Pooling means the fit's domain spans the *union* of
+    precursor and fragment m/z, so it doesn't silently extrapolate past its own
+    training range.
 
-    `config["fit_separately"]` (bool, default `False`) switches to fitting the same
-    model/hyperparameters independently on precursor-only and fragment-only data
-    instead -- two correctors instead of one, each responsible only for its own
-    residuals; `tof2mz` (fragment-only, see above) always uses the fragment corrector.
-    `precursor_tol`/`fragment_tol` are both `config["tolerance_percentiles"]` applied
-    to each type's own residual under whichever corrector applies to it, so the two
-    windows can still differ even in pooled mode (fragments may simply be noisier
-    around the same fitted trend).
+    `config["fit_separately"]` (default `False`) fits the same model/hyperparameters
+    independently on precursor-only and fragment-only data instead -- two correctors,
+    each responsible only for its own residuals; `tof2mz` always uses the fragment
+    corrector. `precursor_tol`/`fragment_tol` are both `config["tolerance_percentiles"]`
+    applied to each type's own residual, so the two windows can differ even pooled.
 
-    `plot_path`, if given, saves a diagnostic scatter+trendline plot
-    (`_plot_recalibration_fit`) from this exact fit -- no re-reading or re-fitting.
+    `plot_path`, if given, saves a diagnostic plot (`_plot_recalibration_fit`) from
+    this exact fit -- no re-reading or re-fitting.
 
     Every corrector is immediately distilled via `to_numba_correction` and used as
-    that from here on (residuals, `tof2mz`, the plot) -- one numba code path by
-    default rather than a separate opt-in, so whatever this fits is already in the
-    form other numba-compiled pipeline code can embed directly.
+    that from here on -- one numba code path by default, so whatever this fits is
+    already in a form other numba-compiled pipeline code can embed directly.
     """
     df = filter_top_psms(sage_results_tsv, fdr)
     fragments = _confident_matched_fragments(matched_fragments, df["psm_id"])
@@ -601,23 +684,22 @@ def plot_recalibrated_ppm(
     fdr: float,
     plot_path: str | Path,
 ) -> None:
-    """Two-panel plot: the marginal `precursor_ppm` distribution (top) and the
-    marginal fragment `fragment_ppm` distribution (bottom), both unconditional on
-    m/z -- plain 1D histograms, not the scatter-vs-mz style of
-    `_plot_recalibration_fit` -- overlaid before vs. after recalibration.
+    """Two-panel plot: marginal `precursor_ppm` (top) and `fragment_ppm` (bottom)
+    distributions, both unconditional on m/z (plain 1D histograms, unlike
+    `_plot_recalibration_fit`'s scatter-vs-mz), overlaid before vs. after
+    recalibration.
 
     `initial_sage_results_tsv`/`initial_matched_fragments` are the *first* SAGE
-    pass's own outputs -- the uncorrected search run on
-    `recalibration_precursor_selection`'s subset, the same data `recalibrate()` fits
-    its correction from. `sage_results_tsv`/`matched_fragments` are the *second*,
-    final pass's own outputs -- full precursor population, already searched with the
-    corrected tof2mz/tolerances baked in. These two searches don't share a precursor
-    population (subset vs. full), so each panel is a shape/spread comparison, not a
-    paired per-precursor/per-fragment one.
+    pass's outputs -- the uncorrected search on `recalibration_precursor_selection`'s
+    subset, the same data `recalibrate()` fits from. `sage_results_tsv`/
+    `matched_fragments` are the *second*, final pass's outputs -- full precursor
+    population, already searched with the corrected tof2mz/tolerances baked in.
+    These don't share a precursor population (subset vs. full), so each panel is a
+    shape/spread comparison, not a paired one.
 
-    `tolerance["precursor_tol"]["ppm"]`/`tolerance["fragment_tol"]["ppm"]` (the same
-    dict `recalibrate()` returned and that the second pass was actually run with)
-    are drawn as reference bands in their respective panels.
+    `tolerance["precursor_tol"]["ppm"]`/`["fragment_tol"]["ppm"]` (the dict
+    `recalibrate()` returned, that the second pass actually ran with) are drawn as
+    reference bands.
     """
     import matplotlib
     matplotlib.use("Agg")
