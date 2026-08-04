@@ -18,9 +18,11 @@ def main() -> None:
         "apply it to a tof2mz array."
     )
     parser.add_argument("sage_results_tsv", type=Path, help="results.sage.tsv from the calibration pass")
+    parser.add_argument("matched_fragments", type=Path, help="matched_fragments.sage.tsv from the calibration pass")
     parser.add_argument("tof2mz", type=Path, help="Input tof2mz mmappet array")
     parser.add_argument("recalibrated_tof2mz", type=Path, help="Output corrected tof2mz mmappet array")
     parser.add_argument("tolerance", type=Path, help="Output tolerance JSON path")
+    parser.add_argument("plot", type=Path, help="Output diagnostic fit plot PNG path")
     parser.add_argument("--config", required=True, type=Path, help="Recalibration TOML config")
     parser.add_argument("--fdr", required=True, type=float, help="Peptide-level FDR threshold")
     args = parser.parse_args()
@@ -29,7 +31,10 @@ def main() -> None:
         config = tomllib.load(handle)
 
     tof2mz = load_from_folder(args.tof2mz)
-    new_tof2mz, tolerance = recalibrate(args.sage_results_tsv, tof2mz, config, args.fdr)
+    new_tof2mz, tolerance = recalibrate(
+        args.sage_results_tsv, args.matched_fragments, tof2mz, config, args.fdr,
+        plot_path=args.plot,
+    )
 
     dump_to_folder(new_tof2mz, args.recalibrated_tof2mz)
     args.tolerance.parent.mkdir(parents=True, exist_ok=True)
