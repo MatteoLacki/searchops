@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+import numba
 import numpy as np
 import pandas as pd
 from scipy.interpolate import BSpline, CubicSpline
@@ -341,14 +342,16 @@ def _plot_recalibration_fit(
     precursor_ppm: np.ndarray,
     fragment_mz: np.ndarray,
     fragment_ppm: np.ndarray,
-    correction: Callable[[np.ndarray], np.ndarray],
+    precursor_correction: Callable[[np.ndarray], np.ndarray],
+    fragment_correction: Callable[[np.ndarray], np.ndarray],
     config: dict,
 ) -> None:
     """Scatter both precursor and fragment ppm-error clouds (still the 1D case --
     every current model regresses ppm against m/z alone; a model using more
     dimensions would need a scatterplot-matrix instead, not built since nothing uses
-    more than one dimension yet) plus the one fitted trendline shared by both
-    (see `recalibrate()`)."""
+    more than one dimension yet) plus each type's own fitted trendline. When
+    `fit_separately` is off, `precursor_correction`/`fragment_correction` are the
+    same object (see `recalibrate()`) so the two lines coincide."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -365,13 +368,20 @@ def _plot_recalibration_fit(
         label=f"precursors (n={len(precursor_mz):_})",
     )
 
-    line_mz = np.linspace(
-        min(precursor_mz.min(), fragment_mz.min()),
-        max(precursor_mz.max(), fragment_mz.max()),
-        400,
+    fragment_line_mz = np.linspace(fragment_mz.min(), fragment_mz.max(), 400)
+    ax.plot(
+        fragment_line_mz, fragment_correction(fragment_line_mz),
+        color="black", linewidth=2.5, linestyle="--" if fragment_correction is not precursor_correction else "-",
+        label="fitted correction (fragments)" if fragment_correction is not precursor_correction else "fitted correction",
     )
-    ax.plot(line_mz, correction(line_mz), color="black", linewidth=2.5, label="fitted correction")
-    ax.axhline(0, color="#808080", linewidth=1, linestyle="--")
+    if fragment_correction is not precursor_correction:
+        precursor_line_mz = np.linspace(precursor_mz.min(), precursor_mz.max(), 400)
+        ax.plot(
+            precursor_line_mz, precursor_correction(precursor_line_mz),
+            color="black", linewidth=2.5, linestyle="-",
+            label="fitted correction (precursors)",
+        )
+    ax.axhline(0, color="#808080", linewidth=1, linestyle=":")
     ax.set_xlabel("m/z")
     ax.set_ylabel("ppm error")
     ax.legend(fontsize=9, loc="best")
@@ -387,6 +397,74 @@ def _plot_recalibration_fit(
     plt.close(fig)
 
 
+def to_numba_correction(
+    correction: Callable[[np.ndarray], np.ndarray],
+    mz_lo: float, mz_hi: float, n_grid: int = 2000,
+) -> Callable[[float], float]:
+    """Distill any `fit_correction()`-style closure into a numba `@njit` scalar
+    function, callable directly from other numba-compiled (including
+    `@njit(parallel=True)`/`prange`) code -- none of `CubicSpline`/`BSpline`/
+    `XGBRegressor` (used internally by various models) are numba-callable
+    themselves, but every model already reduces to a plain array-in-array-out
+    function, so sampling it on a dense grid and distilling that into a lookup
+    table works uniformly regardless of which model produced it.
+
+    Deliberately *not* `np.interp` (which does an O(log n) binary search per
+    call): `breakpoints` is evenly spaced by construction, so the containing
+    interval is a single O(1) division, no search needed -- ~35-40x faster in
+    practice than an equivalent numba `np.interp` call, benchmarked on this
+    exact use case.
+
+    `breakpoints`/`values` are baked in via closure (not passed as explicit
+    arguments) so the call site is just `corrector(mz)` -- simpler than a
+    (function, args) pair, at the cost of each call to `to_numba_correction`
+    triggering its own fresh one-time JIT compile (no `cache=True`: a closure
+    over array freevars can't be meaningfully reused across process restarts
+    the way a plain function with array arguments could be). That one-time
+    compile per fitted model is the normal numba usage pattern regardless
+    (compile once, apply to many values afterward).
+
+    `mz_lo`/`mz_hi` should cover the full range this correction will ever be
+    queried at, not just the range it was fit on -- e.g. in `recalibrate()`,
+    that's the union of the fitting data's own m/z range and the full `tof2mz`
+    lookup table's range, since the latter can extend further. Whatever
+    `correction` itself does beyond its own fitted range (hold constant, taper
+    to flat, etc.) carries through automatically, since `values` is produced by
+    calling the original `correction` on the grid, not reimplemented here.
+    """
+    breakpoints = np.linspace(mz_lo, mz_hi, n_grid)
+    values = np.asarray(correction(breakpoints), dtype=np.float64)
+    spacing = (mz_hi - mz_lo) / (n_grid - 1)
+    inv_spacing = 1.0 / spacing
+    n = n_grid
+
+    @numba.njit(nogil=True)
+    def corrector(mz):
+        idx_f = (mz - mz_lo) * inv_spacing
+        if idx_f <= 0.0:
+            return values[0]
+        if idx_f >= n - 1:
+            return values[n - 1]
+        idx = int(idx_f)
+        frac = idx_f - idx
+        return values[idx] * (1.0 - frac) + values[idx + 1] * frac
+
+    return corrector
+
+
+@numba.njit(parallel=True, nogil=True)
+def _apply_numba_correction(mz_array: np.ndarray, corrector) -> np.ndarray:
+    """Apply a `to_numba_correction()`-produced scalar corrector to a whole array,
+    in parallel -- used internally wherever `recalibrate()` needs array-in-array-out
+    behavior (residuals, `tof2mz`, the diagnostic plot); the scalar `corrector`
+    itself is what's meant for embedding directly in other multithreaded numba code.
+    """
+    out = np.empty(mz_array.shape, dtype=np.float64)
+    for i in numba.prange(mz_array.shape[0]):
+        out[i] = corrector(mz_array[i])
+    return out
+
+
 def recalibrate(
     sage_results_tsv: str | Path,
     matched_fragments: str | Path,
@@ -400,44 +478,74 @@ def recalibrate(
     for why precursor mz needs its own separate correction step, done elsewhere by
     `recalibrate-precursor-mz`).
 
-    One `fit_correction` model is fit directly on precursor and fragment (mz, ppm)
-    data pooled together, with no per-type adjustment at all -- fragment residuals
-    via `matched_fragments.sage.tsv`'s `fragment_mz_experimental`/
+    By default one `fit_correction` model is fit directly on precursor and fragment
+    (mz, ppm) data pooled together, with no per-type adjustment at all -- fragment
+    residuals via `matched_fragments.sage.tsv`'s `fragment_mz_experimental`/
     `fragment_mz_calculated`, since Sage's own per-PSM `fragment_ppm` is an
     intensity-weighted mean of *absolute* error and cannot give a signed residual.
     Pooling (rather than fitting on precursor m/z alone and evaluating on fragments'
     much wider range, as an earlier version of this function did) means the fit's
     domain spans the *union* of precursor and fragment m/z, so it doesn't silently
-    extrapolate past its own training range. `precursor_tol`/`fragment_tol` are both
-    `config["tolerance_percentiles"]` applied to each type's own residual under this
-    one shared correction, so the two windows can still differ (fragments may simply
-    be noisier around the same fitted trend) even though nothing about the fit itself
-    is type-specific.
+    extrapolate past its own training range.
+
+    `config["fit_separately"]` (bool, default `False`) switches to fitting the same
+    model/hyperparameters independently on precursor-only and fragment-only data
+    instead -- two correctors instead of one, each responsible only for its own
+    residuals; `tof2mz` (fragment-only, see above) always uses the fragment corrector.
+    `precursor_tol`/`fragment_tol` are both `config["tolerance_percentiles"]` applied
+    to each type's own residual under whichever corrector applies to it, so the two
+    windows can still differ even in pooled mode (fragments may simply be noisier
+    around the same fitted trend).
 
     `plot_path`, if given, saves a diagnostic scatter+trendline plot
     (`_plot_recalibration_fit`) from this exact fit -- no re-reading or re-fitting.
+
+    Every corrector is immediately distilled via `to_numba_correction` and used as
+    that from here on (residuals, `tof2mz`, the plot) -- one numba code path by
+    default rather than a separate opt-in, so whatever this fits is already in the
+    form other numba-compiled pipeline code can embed directly.
     """
     df = filter_top_psms(sage_results_tsv, fdr)
     fragments = _confident_matched_fragments(matched_fragments, df["psm_id"])
 
-    pooled_df = pd.DataFrame({
-        "precursor_mz": np.concatenate([
-            df["precursor_mz"].to_numpy(),
-            fragments["fragment_mz_experimental"].to_numpy(),
-        ]),
-        "precursor_ppm": np.concatenate([
-            df["precursor_ppm"].to_numpy(),
-            fragments["fragment_ppm"].to_numpy(),
-        ]),
-    })
-    correction = fit_correction(pooled_df, config)
+    precursor_mz = df["precursor_mz"].to_numpy()
+    precursor_ppm = df["precursor_ppm"].to_numpy()
+    fragment_mz = fragments["fragment_mz_experimental"].to_numpy()
+    fragment_ppm = fragments["fragment_ppm"].to_numpy()
 
-    residual_precursor_ppm = df["precursor_ppm"].to_numpy() - correction(
-        df["precursor_mz"].to_numpy()
-    )
-    residual_fragment_ppm = fragments["fragment_ppm"].to_numpy() - correction(
-        fragments["fragment_mz_experimental"].to_numpy()
-    )
+    n_grid = config.get("numba_grid_points", 2000)
+
+    def build_correction(fitted, mz_lo, mz_hi):
+        numba_correction = to_numba_correction(fitted, float(mz_lo), float(mz_hi), n_grid)
+        return lambda mz: _apply_numba_correction(np.asarray(mz, dtype=np.float64), numba_correction)
+
+    if config.get("fit_separately", False):
+        precursor_fit = fit_correction(
+            pd.DataFrame({"precursor_mz": precursor_mz, "precursor_ppm": precursor_ppm}), config
+        )
+        fragment_fit = fit_correction(
+            pd.DataFrame({"precursor_mz": fragment_mz, "precursor_ppm": fragment_ppm}), config
+        )
+        precursor_correction = build_correction(precursor_fit, precursor_mz.min(), precursor_mz.max())
+        fragment_correction = build_correction(
+            fragment_fit, min(fragment_mz.min(), np.min(tof2mz)), max(fragment_mz.max(), np.max(tof2mz))
+        )
+    else:
+        pooled_df = pd.DataFrame({
+            "precursor_mz": np.concatenate([precursor_mz, fragment_mz]),
+            "precursor_ppm": np.concatenate([precursor_ppm, fragment_ppm]),
+        })
+        fitted_correction = fit_correction(pooled_df, config)
+        shared_correction = build_correction(
+            fitted_correction,
+            min(pooled_df["precursor_mz"].min(), np.min(tof2mz)),
+            max(pooled_df["precursor_mz"].max(), np.max(tof2mz)),
+        )
+        precursor_correction = shared_correction
+        fragment_correction = shared_correction
+
+    residual_precursor_ppm = precursor_ppm - precursor_correction(precursor_mz)
+    residual_fragment_ppm = fragment_ppm - fragment_correction(fragment_mz)
     lo_pct, hi_pct = config["tolerance_percentiles"]
     precursor_tol = [
         float(np.percentile(residual_precursor_ppm, lo_pct)),
@@ -448,14 +556,14 @@ def recalibrate(
         float(np.percentile(residual_fragment_ppm, hi_pct)),
     ]
 
-    new_tof2mz = tof2mz / (1.0 + correction(tof2mz) * 1e-6)
+    new_tof2mz = tof2mz / (1.0 + fragment_correction(tof2mz) * 1e-6)
 
     if plot_path is not None:
         _plot_recalibration_fit(
             plot_path,
-            df["precursor_mz"].to_numpy(), df["precursor_ppm"].to_numpy(),
-            fragments["fragment_mz_experimental"].to_numpy(), fragments["fragment_ppm"].to_numpy(),
-            correction,
+            precursor_mz, precursor_ppm,
+            fragment_mz, fragment_ppm,
+            precursor_correction, fragment_correction,
             config,
         )
 
@@ -464,3 +572,84 @@ def recalibrate(
         "fragment_tol": {"ppm": fragment_tol},
     }
     return new_tof2mz.astype(np.float32), tolerance
+
+
+def _hist_panel(ax, before, after, lo_tol, hi_tol, xlabel, title) -> None:
+    ax.hist(
+        before, bins=200, density=True, alpha=0.5, color="#E69F00",
+        label=f"before recalibration (n={len(before):_})",
+    )
+    ax.hist(
+        after, bins=200, density=True, alpha=0.5, color="#0072B2",
+        label=f"after recalibration (n={len(after):_})",
+    )
+    ax.axvline(0, color="#808080", linewidth=1, linestyle=":")
+    ax.axvline(lo_tol, color="#D55E00", linewidth=1.5, linestyle="--", label="tolerance")
+    ax.axvline(hi_tol, color="#D55E00", linewidth=1.5, linestyle="--")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("density")
+    ax.legend(fontsize=9, loc="best")
+    ax.set_title(title)
+
+
+def plot_recalibrated_ppm(
+    initial_sage_results_tsv: str | Path,
+    sage_results_tsv: str | Path,
+    initial_matched_fragments: str | Path,
+    matched_fragments: str | Path,
+    tolerance: dict,
+    fdr: float,
+    plot_path: str | Path,
+) -> None:
+    """Two-panel plot: the marginal `precursor_ppm` distribution (top) and the
+    marginal fragment `fragment_ppm` distribution (bottom), both unconditional on
+    m/z -- plain 1D histograms, not the scatter-vs-mz style of
+    `_plot_recalibration_fit` -- overlaid before vs. after recalibration.
+
+    `initial_sage_results_tsv`/`initial_matched_fragments` are the *first* SAGE
+    pass's own outputs -- the uncorrected search run on
+    `recalibration_precursor_selection`'s subset, the same data `recalibrate()` fits
+    its correction from. `sage_results_tsv`/`matched_fragments` are the *second*,
+    final pass's own outputs -- full precursor population, already searched with the
+    corrected tof2mz/tolerances baked in. These two searches don't share a precursor
+    population (subset vs. full), so each panel is a shape/spread comparison, not a
+    paired per-precursor/per-fragment one.
+
+    `tolerance["precursor_tol"]["ppm"]`/`tolerance["fragment_tol"]["ppm"]` (the same
+    dict `recalibrate()` returned and that the second pass was actually run with)
+    are drawn as reference bands in their respective panels.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    initial_df = filter_top_psms(initial_sage_results_tsv, fdr)
+    final_df = filter_top_psms(sage_results_tsv, fdr)
+    initial_precursor_ppm = initial_df["precursor_ppm"].to_numpy()
+    final_precursor_ppm = final_df["precursor_ppm"].to_numpy()
+
+    initial_fragment_ppm = _confident_matched_fragments(
+        initial_matched_fragments, initial_df["psm_id"]
+    )["fragment_ppm"].to_numpy()
+    final_fragment_ppm = _confident_matched_fragments(
+        matched_fragments, final_df["psm_id"]
+    )["fragment_ppm"].to_numpy()
+
+    precursor_lo, precursor_hi = tolerance["precursor_tol"]["ppm"]
+    fragment_lo, fragment_hi = tolerance["fragment_tol"]["ppm"]
+
+    fig, (ax_precursor, ax_fragment) = plt.subplots(2, 1, figsize=(10, 10))
+    _hist_panel(
+        ax_precursor, initial_precursor_ppm, final_precursor_ppm, precursor_lo, precursor_hi,
+        "precursor ppm error", f"Precursor ppm error distribution, before vs after recalibration (fdr={fdr})",
+    )
+    _hist_panel(
+        ax_fragment, initial_fragment_ppm, final_fragment_ppm, fragment_lo, fragment_hi,
+        "fragment ppm error", f"Fragment ppm error distribution, before vs after recalibration (fdr={fdr})",
+    )
+    fig.tight_layout()
+
+    plot_path = Path(plot_path)
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(plot_path, dpi=300)
+    plt.close(fig)
