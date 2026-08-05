@@ -25,6 +25,10 @@ def main() -> None:
     parser.add_argument("plot", type=Path, help="Output diagnostic fit plot PNG path")
     parser.add_argument("--config", required=True, type=Path, help="Recalibration TOML config")
     parser.add_argument("--fdr", required=True, type=float, help="Peptide-level FDR threshold")
+    parser.add_argument(
+        "--mz-recalibration", type=Path, default=None,
+        help="Optional output path for the MzRecalibration spline artifact (dimension 'mz')",
+    )
     args = parser.parse_args()
 
     with args.config.open("rb") as handle:
@@ -34,6 +38,7 @@ def main() -> None:
     new_tof2mz, tolerance = recalibrate(
         args.sage_results_tsv, args.matched_fragments, tof2mz, config, args.fdr,
         plot_path=args.plot,
+        mz_recalibration_path=args.mz_recalibration,
     )
 
     dump_to_folder(new_tof2mz, args.recalibrated_tof2mz)

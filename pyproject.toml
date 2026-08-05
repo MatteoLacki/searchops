@@ -24,6 +24,7 @@ dependencies = [
     "pandas_ops",
     "mmappet",
     "scipy",
+    "xgboost",
 ]
 
 [project.scripts]
