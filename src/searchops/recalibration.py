@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-import mmappet
 import numba
 import numpy as np
 import pandas as pd
@@ -21,6 +20,7 @@ from scipy.sparse.linalg import spsolve
 from xgboost import DMatrix, XGBRegressor
 
 from pandas_ops.io import read_df
+from timstofu.mzrecalibration import EvenlySpacedLinearSpline, MzRecalibration
 
 PROTON_MASS = 1.00727646688
 
@@ -498,145 +498,10 @@ def _plot_recalibration_fit(
     plt.close(fig)
 
 
-class MzRecalibrationDim:
-    """A fitted ppm-correction curve for one dimension (e.g. m/z), stored as a
-    dense, evenly spaced grid rather than the model that produced it -- every
-    `fit_correction`/`fit_additive_correction` model reduces to a plain
-    array-in-array-out function, so sampling it on a grid gives one representation
-    and one evaluator that covers all of them uniformly.
-
-    `x` itself is never stored: it's `linspace(x_min, x_max, len(ppm))` by
-    construction, so "strictly increasing" and "evenly spaced" hold automatically
-    instead of needing to be checked or persisted.
-    """
-
-    def __init__(self, x_min: float, x_max: float, ppm: np.ndarray):
-        ppm = np.asarray(ppm, dtype=np.float64)
-        if ppm.shape[0] < 2:
-            raise ValueError(f"need at least two grid points, got {ppm.shape[0]}")
-        if not np.isfinite(ppm).all():
-            raise ValueError("ppm values must be finite")
-        if not (np.isfinite(x_min) and np.isfinite(x_max) and x_min < x_max):
-            raise ValueError(f"require finite x_min < x_max, got x_min={x_min!r} x_max={x_max!r}")
-        self.x_min = float(x_min)
-        self.x_max = float(x_max)
-        self.ppm = ppm
-
-    def corrector(self) -> Callable[[float], float]:
-        """Distill into a numba `@njit` scalar function, callable directly from
-        other numba-compiled (including `parallel=True`/`prange`) code.
-
-        Deliberately *not* `np.interp` (an O(log n) binary search per call): the
-        grid is evenly spaced by construction, so the containing interval is a
-        single O(1) division -- ~35-40x faster in practice, benchmarked on this
-        exact use case. Clamps to the endpoint value outside `[x_min, x_max]`.
-
-        `x_min`/spacing/`values` are baked in via closure so the call site is just
-        `corrector(x)`, at the cost of a fresh one-time JIT compile per call (no
-        `cache=True`: a closure over array freevars can't be meaningfully cached
-        across process restarts) -- the normal numba usage pattern regardless
-        (compile once, apply to many values after).
-        """
-        x_min = self.x_min
-        n = self.ppm.shape[0]
-        spacing = (self.x_max - x_min) / (n - 1)
-        inv_spacing = 1.0 / spacing
-        values = self.ppm
-
-        @numba.njit(nogil=True)
-        def corrector(x):
-            idx_f = (x - x_min) * inv_spacing
-            if idx_f <= 0.0:
-                return values[0]
-            if idx_f >= n - 1:
-                return values[n - 1]
-            idx = int(idx_f)
-            frac = idx_f - idx
-            return values[idx] * (1.0 - frac) + values[idx + 1] * frac
-
-        return corrector
-
-    def dump(self, path: str | Path) -> None:
-        """Write `<path>/grid.mmappet` (`x_min`, `x_max`) and `<path>/ppms.mmappet`
-        (`ppm`, one row per grid point)."""
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
-        grid = mmappet.open_new_dataset_dct(
-            path / "grid.mmappet",
-            scheme=mmappet.get_schema(x_min=np.float64, x_max=np.float64),
-            nrows=1,
-        )
-        grid["x_min"][0] = self.x_min
-        grid["x_max"][0] = self.x_max
-        ppms = mmappet.open_new_dataset_dct(
-            path / "ppms.mmappet",
-            scheme=mmappet.get_schema(ppm=np.float64),
-            nrows=self.ppm.shape[0],
-        )
-        ppms["ppm"][:] = self.ppm
-
-    @classmethod
-    def load(cls, path: str | Path) -> "MzRecalibrationDim":
-        path = Path(path)
-        grid = mmappet.open_dataset_dct(path / "grid.mmappet")
-        ppms = mmappet.open_dataset_dct(path / "ppms.mmappet")
-        return cls(
-            x_min=float(grid["x_min"][0]),
-            x_max=float(grid["x_max"][0]),
-            ppm=np.asarray(ppms["ppm"], dtype=np.float64),
-        )
-
-
-class MzRecalibration:
-    """A recalibration artifact: one or more `MzRecalibrationDim` curves keyed by
-    dimension name, plus a shared additive-model `bias` (see
-    `fit_additive_correction`; `0.0` when a single-dimension `fit_correction` model
-    produced no separate bias term to store).
-
-    Serialized as `bias.mmappet` plus one `<dimension>/` subdirectory per curve,
-    beneath a directory conventionally given the `.mzcalib` extension. Only `mz` is
-    populated so far (`recalibrate()`), but nothing here rejects other dimension
-    names a later multi-dimensional fit may add.
-    """
-
-    def __init__(self, dims: dict[str, MzRecalibrationDim], bias: float = 0.0):
-        if not dims:
-            raise ValueError("dims must be non-empty")
-        if not np.isfinite(bias):
-            raise ValueError(f"bias must be finite, got {bias!r}")
-        self.dims = dims
-        self.bias = float(bias)
-
-    def corrector(self, dimension: str) -> Callable[[float], float]:
-        return self.dims[dimension].corrector()
-
-    def dump(self, path: str | Path) -> None:
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
-        bias_ds = mmappet.open_new_dataset_dct(
-            path / "bias.mmappet", scheme=mmappet.get_schema(bias=np.float64), nrows=1,
-        )
-        bias_ds["bias"][0] = self.bias
-        for name, dim in self.dims.items():
-            dim.dump(path / name)
-
-    @classmethod
-    def load(cls, path: str | Path) -> "MzRecalibration":
-        path = Path(path)
-        bias_ds = mmappet.open_dataset_dct(path / "bias.mmappet")
-        bias = float(bias_ds["bias"][0])
-        dims = {
-            child.name: MzRecalibrationDim.load(child)
-            for child in sorted(path.iterdir())
-            if child.is_dir() and (child / "grid.mmappet").is_dir()
-        }
-        return cls(dims=dims, bias=bias)
-
-
 def _correction_dim(
     correction: Callable[[np.ndarray], np.ndarray],
     lo: float, hi: float, n_grid: int,
-) -> MzRecalibrationDim:
+) -> EvenlySpacedLinearSpline:
     """Sample a `fit_correction()`-style closure on an evenly spaced grid spanning
     `[lo, hi]`. `lo`/`hi` should cover the full range this will ever be queried at,
     not just the range it was fit on -- e.g. in `recalibrate()`, the union of the
@@ -647,7 +512,7 @@ def _correction_dim(
     """
     breakpoints = np.linspace(lo, hi, n_grid)
     values = np.asarray(correction(breakpoints), dtype=np.float64)
-    return MzRecalibrationDim(float(lo), float(hi), values)
+    return EvenlySpacedLinearSpline(float(lo), float(hi), values)
 
 
 def to_numba_correction(
@@ -655,12 +520,12 @@ def to_numba_correction(
     mz_lo: float, mz_hi: float, n_grid: int = 2000,
 ) -> Callable[[float], float]:
     """Distill any `fit_correction()`-style closure into a numba `@njit` scalar
-    function via `MzRecalibrationDim` -- none of `CubicSpline`/`BSpline`/
+    function via `EvenlySpacedLinearSpline` -- none of `CubicSpline`/`BSpline`/
     `XGBRegressor` are numba-callable themselves, but every model reduces to a
     plain array-in-array-out function, so grid-sampling it works uniformly
     regardless of which model produced it.
     """
-    return _correction_dim(correction, mz_lo, mz_hi, n_grid).corrector()
+    return _correction_dim(correction, mz_lo, mz_hi, n_grid).njit_evaluator()
 
 
 @numba.njit(parallel=True, nogil=True)
@@ -710,7 +575,7 @@ def recalibrate(
     an `MzRecalibration` artifact (dimension `"mz"`, `bias=0.0`) -- additive to
     `new_tof2mz`, not a replacement for it.
 
-    Every corrector is immediately distilled via `MzRecalibrationDim`/
+    Every corrector is immediately distilled via `EvenlySpacedLinearSpline`/
     `to_numba_correction` and used as that from here on -- one numba code path by
     default, so whatever this fits is already in a form other numba-compiled
     pipeline code can embed directly.
@@ -727,7 +592,7 @@ def recalibrate(
 
     def build_correction(fitted, mz_lo, mz_hi):
         dim = _correction_dim(fitted, mz_lo, mz_hi, n_grid)
-        numba_correction = dim.corrector()
+        numba_correction = dim.njit_evaluator()
         apply = lambda mz: _apply_numba_correction(np.asarray(mz, dtype=np.float64), numba_correction)
         return apply, dim
 

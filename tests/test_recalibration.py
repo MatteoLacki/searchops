@@ -4,34 +4,35 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from searchops.recalibration import MzRecalibration, MzRecalibrationDim, recalibrate
+from searchops.recalibration import recalibrate
+from timstofu.mzrecalibration import EvenlySpacedLinearSpline, MzRecalibration
 
 
-# --- MzRecalibrationDim -----------------------------------------------------
+# --- EvenlySpacedLinearSpline -------------------------------------------------
 
 def test_dim_round_trip(tmp_path: Path) -> None:
     ppm = np.array([1.0, 2.0, 4.0, 3.0, -1.0], dtype=np.float64)
-    dim = MzRecalibrationDim(x_min=100.0, x_max=500.0, ppm=ppm)
+    dim = EvenlySpacedLinearSpline(x_min=100.0, x_max=500.0, y=ppm)
     dim.dump(tmp_path / "mz")
 
-    loaded = MzRecalibrationDim.load(tmp_path / "mz")
+    loaded = EvenlySpacedLinearSpline.load(tmp_path / "mz")
     assert loaded.x_min == 100.0
     assert loaded.x_max == 500.0
-    np.testing.assert_array_equal(loaded.ppm, ppm)
+    np.testing.assert_array_equal(loaded.y, ppm)
 
 
 def test_dim_corrector_matches_nodes() -> None:
     ppm = np.array([1.0, 2.0, 4.0, 3.0, -1.0], dtype=np.float64)
-    dim = MzRecalibrationDim(x_min=0.0, x_max=4.0, ppm=ppm)
-    corrector = dim.corrector()
+    dim = EvenlySpacedLinearSpline(x_min=0.0, x_max=4.0, y=ppm)
+    corrector = dim.njit_evaluator()
     for x, expected in zip([0.0, 1.0, 2.0, 3.0, 4.0], ppm):
         assert corrector(x) == pytest.approx(expected)
 
 
 def test_dim_corrector_interpolates_linearly() -> None:
     ppm = np.array([0.0, 10.0], dtype=np.float64)
-    dim = MzRecalibrationDim(x_min=0.0, x_max=1.0, ppm=ppm)
-    corrector = dim.corrector()
+    dim = EvenlySpacedLinearSpline(x_min=0.0, x_max=1.0, y=ppm)
+    corrector = dim.njit_evaluator()
     assert corrector(0.25) == pytest.approx(2.5)
     assert corrector(0.5) == pytest.approx(5.0)
     assert corrector(0.75) == pytest.approx(7.5)
@@ -39,34 +40,34 @@ def test_dim_corrector_interpolates_linearly() -> None:
 
 def test_dim_corrector_clamps_outside_range() -> None:
     ppm = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-    dim = MzRecalibrationDim(x_min=10.0, x_max=20.0, ppm=ppm)
-    corrector = dim.corrector()
+    dim = EvenlySpacedLinearSpline(x_min=10.0, x_max=20.0, y=ppm)
+    corrector = dim.njit_evaluator()
     assert corrector(-100.0) == pytest.approx(1.0)
     assert corrector(1e6) == pytest.approx(3.0)
 
 
 def test_dim_rejects_too_few_nodes() -> None:
     with pytest.raises(ValueError):
-        MzRecalibrationDim(x_min=0.0, x_max=1.0, ppm=np.array([1.0]))
+        EvenlySpacedLinearSpline(x_min=0.0, x_max=1.0, y=np.array([1.0]))
 
 
 def test_dim_rejects_non_finite_ppm() -> None:
     with pytest.raises(ValueError):
-        MzRecalibrationDim(x_min=0.0, x_max=1.0, ppm=np.array([1.0, np.nan]))
+        EvenlySpacedLinearSpline(x_min=0.0, x_max=1.0, y=np.array([1.0, np.nan]))
 
 
 def test_dim_rejects_non_increasing_range() -> None:
     with pytest.raises(ValueError):
-        MzRecalibrationDim(x_min=1.0, x_max=1.0, ppm=np.array([1.0, 2.0]))
+        EvenlySpacedLinearSpline(x_min=1.0, x_max=1.0, y=np.array([1.0, 2.0]))
     with pytest.raises(ValueError):
-        MzRecalibrationDim(x_min=1.0, x_max=0.0, ppm=np.array([1.0, 2.0]))
+        EvenlySpacedLinearSpline(x_min=1.0, x_max=0.0, y=np.array([1.0, 2.0]))
 
 
 # --- MzRecalibration ---------------------------------------------------------
 
 def test_mz_recalibration_round_trip_multi_dim(tmp_path: Path) -> None:
-    mz_dim = MzRecalibrationDim(x_min=100.0, x_max=1000.0, ppm=np.array([1.0, 0.5, -0.5]))
-    rt_dim = MzRecalibrationDim(x_min=0.0, x_max=60.0, ppm=np.array([0.1, 0.2, 0.3, 0.4]))
+    mz_dim = EvenlySpacedLinearSpline(x_min=100.0, x_max=1000.0, y=np.array([1.0, 0.5, -0.5]))
+    rt_dim = EvenlySpacedLinearSpline(x_min=0.0, x_max=60.0, y=np.array([0.1, 0.2, 0.3, 0.4]))
     artifact = MzRecalibration(dims={"mz": mz_dim, "rt": rt_dim}, bias=0.75)
 
     path = tmp_path / "recal.mzcalib"
@@ -75,12 +76,12 @@ def test_mz_recalibration_round_trip_multi_dim(tmp_path: Path) -> None:
     loaded = MzRecalibration.load(path)
     assert loaded.bias == pytest.approx(0.75)
     assert set(loaded.dims) == {"mz", "rt"}
-    np.testing.assert_array_equal(loaded.dims["mz"].ppm, mz_dim.ppm)
-    np.testing.assert_array_equal(loaded.dims["rt"].ppm, rt_dim.ppm)
+    np.testing.assert_array_equal(loaded.dims["mz"].y, mz_dim.y)
+    np.testing.assert_array_equal(loaded.dims["rt"].y, rt_dim.y)
 
 
 def test_mz_recalibration_defaults_bias_to_zero(tmp_path: Path) -> None:
-    dim = MzRecalibrationDim(x_min=0.0, x_max=1.0, ppm=np.array([1.0, 2.0]))
+    dim = EvenlySpacedLinearSpline(x_min=0.0, x_max=1.0, y=np.array([1.0, 2.0]))
     artifact = MzRecalibration(dims={"mz": dim})
     artifact.dump(tmp_path / "recal.mzcalib")
 
@@ -89,7 +90,7 @@ def test_mz_recalibration_defaults_bias_to_zero(tmp_path: Path) -> None:
 
 
 def test_mz_recalibration_corrector_dispatches_by_dimension() -> None:
-    mz_dim = MzRecalibrationDim(x_min=0.0, x_max=1.0, ppm=np.array([1.0, 2.0]))
+    mz_dim = EvenlySpacedLinearSpline(x_min=0.0, x_max=1.0, y=np.array([1.0, 2.0]))
     artifact = MzRecalibration(dims={"mz": mz_dim})
     assert artifact.corrector("mz")(1.0) == pytest.approx(2.0)
     with pytest.raises(KeyError):
