@@ -151,7 +151,11 @@ def _fit_pspline(
     c = R @ c_reduced
 
     spline = BSpline(knots, c, degree, extrapolate=False)
-    return lambda x: spline(np.clip(x, lo, hi))
+    # Cast to float64 before clipping: a float32 `x` (e.g. breakpoints derived from
+    # a float32 tof2mz array) clips to a float32-rounded `lo`/`hi`, which can land a
+    # few ULPs outside the spline's float64 knot domain and trigger NaN from
+    # `extrapolate=False`'s strict domain check.
+    return lambda x: spline(np.clip(np.asarray(x, dtype=np.float64), lo, hi))
 
 
 def fit_correction(
