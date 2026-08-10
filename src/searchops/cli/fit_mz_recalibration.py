@@ -1,4 +1,4 @@
-"""Fit and apply a precursor m/z recalibration; narrow SAGE's search tolerances."""
+"""Fit a fragment m/z recalibration from confident SAGE PSMs."""
 
 from __future__ import annotations
 
@@ -7,41 +7,38 @@ import json
 import tomllib
 from pathlib import Path
 
-from timstofu.binary.array_serialization import dump_to_folder, load_from_folder
+import mmappet
 
 from searchops.recalibration import recalibrate
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fit a precursor m/z recalibration from confident SAGE PSMs and "
-        "apply it to a tof2mz array."
+        description="Fit a fragment m/z recalibration from confident SAGE PSMs and "
+        "dump it as an MzRecalibration artifact."
     )
     parser.add_argument("sage_results_tsv", type=Path, help="results.sage.tsv from the calibration pass")
     parser.add_argument("matched_fragments", type=Path, help="matched_fragments.sage.tsv from the calibration pass")
-    parser.add_argument("tof2mz", type=Path, help="Input tof2mz mmappet array")
-    parser.add_argument("recalibrated_tof2mz", type=Path, help="Output corrected tof2mz mmappet array")
+    parser.add_argument("mz_pmsms", type=Path, help="MzPmsms pmsms.mmappet dataset (determines the fragment m/z domain)")
+    parser.add_argument("mz_recalibration", type=Path, help="Output MzRecalibration artifact path (.mzcalib)")
     parser.add_argument("tolerance", type=Path, help="Output tolerance JSON path")
     parser.add_argument("plot", type=Path, help="Output diagnostic fit plot PNG path")
     parser.add_argument("--config", required=True, type=Path, help="Recalibration TOML config")
     parser.add_argument("--fdr", required=True, type=float, help="Peptide-level FDR threshold")
-    parser.add_argument(
-        "--mz-recalibration", type=Path, default=None,
-        help="Optional output path for the MzRecalibration spline artifact (dimension 'mz')",
-    )
     args = parser.parse_args()
 
     with args.config.open("rb") as handle:
         config = tomllib.load(handle)
 
-    tof2mz = load_from_folder(args.tof2mz)
-    new_tof2mz, tolerance = recalibrate(
-        args.sage_results_tsv, args.matched_fragments, tof2mz, config, args.fdr,
-        plot_path=args.plot,
+    fragment_mz = mmappet.open_dataset_dct(args.mz_pmsms)["mz"]
+    tolerance = recalibrate(
+        args.sage_results_tsv, args.matched_fragments,
+        float(fragment_mz.min()), float(fragment_mz.max()),
+        config, args.fdr,
         mz_recalibration_path=args.mz_recalibration,
+        plot_path=args.plot,
     )
 
-    dump_to_folder(new_tof2mz, args.recalibrated_tof2mz)
     args.tolerance.parent.mkdir(parents=True, exist_ok=True)
     with args.tolerance.open("w") as handle:
         json.dump(tolerance, handle, indent=2, sort_keys=True)

@@ -35,7 +35,7 @@ sage-summarize-raw = "searchops.cli.sage_summarize_raw:main"
 sage-pmsms-mapper  = "searchops.cli.sage_pmsms_mapper:main"
 sage_score_mapper  = "searchops.cli.sage_score_mapper:main"
 record-run         = "searchops.cli.record_run:main"
-recalibrate-mz     = "searchops.cli.recalibrate_mz:main"
+fit-mz-recalibration = "searchops.cli.fit_mz_recalibration:main"
 recalibrate-precursor-mz = "searchops.cli.recalibrate_precursor_mz:main"
 plot-recalibrated-ppm = "searchops.cli.plot_recalibrated_ppm:main"
 

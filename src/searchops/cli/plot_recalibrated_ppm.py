@@ -18,7 +18,7 @@ def main() -> None:
     parser.add_argument("sage_results_tsv", type=Path, help="results.sage.tsv from the final (corrected) pass")
     parser.add_argument("initial_matched_fragments", type=Path, help="matched_fragments.sage.tsv from the (uncorrected) calibration pass")
     parser.add_argument("matched_fragments", type=Path, help="matched_fragments.sage.tsv from the final (corrected) pass")
-    parser.add_argument("tolerance", type=Path, help="recalibration_tolerance.json (from recalibrate-mz)")
+    parser.add_argument("tolerance", type=Path, help="recalibration_tolerance.json (from fit-mz-recalibration)")
     parser.add_argument("plot", type=Path, help="Output diagnostic PNG path")
     parser.add_argument("--fdr", required=True, type=float, help="Peptide-level FDR threshold")
     args = parser.parse_args()

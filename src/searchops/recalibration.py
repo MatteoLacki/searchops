@@ -544,14 +544,15 @@ def _apply_numba_correction(mz_array: np.ndarray, corrector) -> np.ndarray:
 def recalibrate(
     sage_results_tsv: str | Path,
     matched_fragments: str | Path,
-    tof2mz: np.ndarray,
+    fragment_mz_min: float,
+    fragment_mz_max: float,
     config: dict,
     fdr: float,
+    mz_recalibration_path: str | Path,
     plot_path: str | Path | None = None,
-    mz_recalibration_path: str | Path | None = None,
-) -> tuple[np.ndarray, dict]:
-    """Fit the ppm correction from confident PSMs and apply it to the tof2mz lookup
-    array (fragments only -- precursor mz gets its own separate correction step,
+) -> dict:
+    """Fit the ppm correction from confident PSMs and dump it as an `MzRecalibration`
+    artifact (fragments only -- precursor mz gets its own separate correction step,
     done elsewhere by `recalibrate-precursor-mz`).
 
     By default one `fit_correction` model is fit on precursor and fragment (mz,
@@ -562,18 +563,25 @@ def recalibrate(
     precursor and fragment m/z, so it doesn't silently extrapolate past its own
     training range.
 
+    `fragment_mz_min`/`fragment_mz_max` extend that domain to the full range the
+    fitted correction will later be queried at (e.g. `MzPmsms`'s actual materialized
+    `mz` column range, not just the confident-PSM subset's range) -- same role the
+    old dense `tof2mz` array's min/max used to play, without needing the whole array.
+
     `config["fit_separately"]` (default `False`) fits the same model/hyperparameters
     independently on precursor-only and fragment-only data instead -- two correctors,
-    each responsible only for its own residuals; `tof2mz` always uses the fragment
-    corrector. `precursor_tol`/`fragment_tol` are both `config["tolerance_percentiles"]`
-    applied to each type's own residual, so the two windows can differ even pooled.
+    each responsible only for its own residuals; the dumped artifact always uses the
+    fragment corrector. `precursor_tol`/`fragment_tol` are both
+    `config["tolerance_percentiles"]` applied to each type's own residual, so the two
+    windows can differ even pooled.
 
     `plot_path`, if given, saves a diagnostic plot (`_plot_recalibration_fit`) from
     this exact fit -- no re-reading or re-fitting.
 
-    `mz_recalibration_path`, if given, dumps the fragment corrector's own grid as
-    an `MzRecalibration` artifact (dimension `"mz"`, `bias=0.0`) -- additive to
-    `new_tof2mz`, not a replacement for it.
+    `mz_recalibration_path` always receives the fragment corrector's own grid as an
+    `MzRecalibration` artifact (dimension `"mz"`, `bias=0.0`) -- the sole output of
+    fitting; applying it to any given `mz` value is a separate step, done elsewhere
+    (`timstofu`'s `recalibrate_pmsms_mz`).
 
     Every corrector is immediately distilled via `EvenlySpacedLinearSpline`/
     `to_numba_correction` and used as that from here on -- one numba code path by
@@ -607,7 +615,7 @@ def recalibrate(
             precursor_fit, precursor_mz.min(), precursor_mz.max()
         )
         fragment_correction, fragment_dim = build_correction(
-            fragment_fit, min(fragment_mz.min(), np.min(tof2mz)), max(fragment_mz.max(), np.max(tof2mz))
+            fragment_fit, min(fragment_mz.min(), fragment_mz_min), max(fragment_mz.max(), fragment_mz_max)
         )
     else:
         pooled_df = pd.DataFrame({
@@ -617,8 +625,8 @@ def recalibrate(
         fitted_correction = fit_correction(pooled_df, config)
         shared_correction, fragment_dim = build_correction(
             fitted_correction,
-            min(pooled_df["precursor_mz"].min(), np.min(tof2mz)),
-            max(pooled_df["precursor_mz"].max(), np.max(tof2mz)),
+            min(pooled_df["precursor_mz"].min(), fragment_mz_min),
+            max(pooled_df["precursor_mz"].max(), fragment_mz_max),
         )
         precursor_correction = shared_correction
         fragment_correction = shared_correction
@@ -635,8 +643,6 @@ def recalibrate(
         float(np.percentile(residual_fragment_ppm, hi_pct)),
     ]
 
-    new_tof2mz = tof2mz / (1.0 + fragment_correction(tof2mz) * 1e-6)
-
     if plot_path is not None:
         _plot_recalibration_fit(
             plot_path,
@@ -646,14 +652,13 @@ def recalibrate(
             config,
         )
 
-    if mz_recalibration_path is not None:
-        MzRecalibration(dims={"mz": fragment_dim}).dump(mz_recalibration_path)
+    MzRecalibration(dims={"mz": fragment_dim}).dump(mz_recalibration_path)
 
     tolerance = {
         "precursor_tol": {"ppm": precursor_tol},
         "fragment_tol": {"ppm": fragment_tol},
     }
-    return new_tof2mz.astype(np.float32), tolerance
+    return tolerance
 
 
 def _hist_panel(ax, before, after, lo_tol, hi_tol, xlabel, title) -> None:

@@ -142,23 +142,19 @@ def _write_calibration_fixtures(root: Path) -> tuple[Path, Path]:
     return sage_results_tsv, matched_fragments_tsv
 
 
-def test_recalibrate_mz_recalibration_path_is_additive(tmp_path: Path) -> None:
+def test_recalibrate_dumps_mz_recalibration(tmp_path: Path) -> None:
     sage_results_tsv, matched_fragments_tsv = _write_calibration_fixtures(tmp_path)
-    tof2mz = np.linspace(100.0, 1500.0, 50).astype(np.float32)
+    fragment_mz_domain = np.linspace(100.0, 1500.0, 50).astype(np.float32)
     config = {"model": "global_median", "tolerance_percentiles": [5, 95], "numba_grid_points": 64}
 
-    baseline_tof2mz, baseline_tolerance = recalibrate(
-        sage_results_tsv, matched_fragments_tsv, tof2mz, config, fdr=0.01,
-    )
-
     artifact_path = tmp_path / "recal.mzcalib"
-    with_artifact_tof2mz, with_artifact_tolerance = recalibrate(
-        sage_results_tsv, matched_fragments_tsv, tof2mz, config, fdr=0.01,
+    tolerance = recalibrate(
+        sage_results_tsv, matched_fragments_tsv,
+        float(fragment_mz_domain.min()), float(fragment_mz_domain.max()),
+        config, fdr=0.01,
         mz_recalibration_path=artifact_path,
     )
-
-    np.testing.assert_array_equal(baseline_tof2mz, with_artifact_tof2mz)
-    assert baseline_tolerance == with_artifact_tolerance
+    assert "precursor_tol" in tolerance and "fragment_tol" in tolerance
 
     artifact = MzRecalibration.load(artifact_path)
     assert artifact.bias == 0.0
@@ -166,10 +162,5 @@ def test_recalibrate_mz_recalibration_path_is_additive(tmp_path: Path) -> None:
 
     # Synthetic fixture has an exact, noiseless +5.0 ppm offset, so the fitted
     # correction should recover it almost exactly at every grid point.
-    actual_ppm = np.array([mz_corrector(float(x)) for x in tof2mz])
+    actual_ppm = np.array([mz_corrector(float(x)) for x in fragment_mz_domain])
     np.testing.assert_allclose(actual_ppm, 5.0, atol=1e-2)
-
-    # Applying the artifact's own correction in float64 should reproduce
-    # `new_tof2mz` up to the float32 downcast `recalibrate()` applies at the end.
-    reapplied = tof2mz.astype(np.float64) / (1.0 + actual_ppm * 1e-6)
-    np.testing.assert_allclose(reapplied.astype(np.float32), with_artifact_tof2mz, atol=1e-2)
