@@ -8,13 +8,15 @@ tof2mz-derived m/z means *dividing* by `(1 + ppm/1e6)`, not adding it.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Callable
 
-import numba
+import mmappet
 import numpy as np
 import pandas as pd
-from scipy.interpolate import BSpline, CubicSpline
+from numba_progress import ProgressBar
+from scipy.interpolate import BSpline
 from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import spsolve
 from xgboost import DMatrix, XGBRegressor
@@ -68,15 +70,6 @@ def _confident_matched_fragments(
     return fragments
 
 
-def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
-    """Weighted median: smallest value where cumulative weight reaches half the total."""
-    order = np.argsort(values)
-    values, weights = values[order], weights[order]
-    cutoff = weights.sum() / 2.0
-    cumulative = np.cumsum(weights)
-    return float(values[np.searchsorted(cumulative, cutoff)])
-
-
 def _derivative_penalized_smooth(
     y: np.ndarray, weight: np.ndarray, lam1: float, lam2: float = 0.0,
 ) -> np.ndarray:
@@ -90,35 +83,25 @@ def _derivative_penalized_smooth(
     along the penalty axis (e.g. node index by increasing m/z).
     """
     n = len(y)
-    D1 = diags([-np.ones(n - 1), np.ones(n - 1)], offsets=[0, 1], shape=(n - 1, n))
+    D1 = diags([-np.ones(n - 1), np.ones(n - 1)], offsets=[0, 1], shape=(n - 1, n))  # type: ignore[reportArgumentType]
     A = diags(weight) + lam1 * (D1.T @ D1)
     if lam2 and n >= 3:
         D2 = diags(
             [np.ones(n - 2), -2 * np.ones(n - 2), np.ones(n - 2)],
-            offsets=[0, 1, 2], shape=(n - 2, n),
+            offsets=[0, 1, 2], shape=(n - 2, n),  # type: ignore[reportArgumentType]
         )
         A = A + lam2 * (D2.T @ D2)
-    return spsolve(A.tocsc(), weight * y)
+    return np.asarray(spsolve(A.tocsc(), weight * y))
 
 
 def _fit_pspline(
     mz: np.ndarray, ppm: np.ndarray, weight: np.ndarray,
     bin_width_da: float, lam1: float, lam2: float, degree: int = 3,
-) -> Callable[[np.ndarray], np.ndarray]:
-    """Penalized B-spline (P-spline, Eilers & Marx 1996): fit B-spline coefficients
-    by penalized weighted least squares, penalizing first/second differences between
-    *adjacent coefficients* (not raw data, unlike `_derivative_penalized_smooth`) --
-    so the result is a genuine C(`degree`-1)-continuous spline, not a penalized set
-    of node values joined by straight lines. Interior knots are dense (every
-    `bin_width_da`), since the penalty rather than knot placement does the
-    smoothing, avoiding the sparse/noisy-node oscillation an unpenalized exact
-    interpolant (`natural_cubic_spline`) can show.
-
-    Boundary knots are clamped, and the first two / last two basis coefficients are
-    each tied together -- for a clamped B-spline, `f'(boundary)` is proportional to
-    the difference between its two boundary coefficients, so tying them forces a
-    flat (zero first-derivative) approach at both ends without pinning the curve to
-    a specific boundary value.
+) -> tuple[BSpline, float, float]:
+    """Penalized B-spline (P-spline, Eilers & Marx 1996): dense interior knots
+    (every `bin_width_da`), boundary coefficient pairs tied so the curve flattens
+    (zero first derivative) at both ends. Returns `(spline, lo, hi)`; evaluate as
+    `spline(np.clip(x, lo, hi))` -- `extrapolate=False` NaNs outside `[lo, hi]`.
     """
     lo, hi = float(mz.min()), float(mz.max())
     n_interior = max(1, int(np.ceil((hi - lo) / bin_width_da)) - 1)
@@ -136,12 +119,12 @@ def _fit_pspline(
 
     BR = B @ R
     W = diags(weight)
-    D1 = diags([-np.ones(n_reduced - 1), np.ones(n_reduced - 1)], offsets=[0, 1], shape=(n_reduced - 1, n_reduced))
+    D1 = diags([-np.ones(n_reduced - 1), np.ones(n_reduced - 1)], offsets=[0, 1], shape=(n_reduced - 1, n_reduced))  # type: ignore[reportArgumentType]
     penalty = lam1 * (D1.T @ D1)
     if lam2 and n_reduced >= 3:
         D2 = diags(
             [np.ones(n_reduced - 2), -2 * np.ones(n_reduced - 2), np.ones(n_reduced - 2)],
-            offsets=[0, 1, 2], shape=(n_reduced - 2, n_reduced),
+            offsets=[0, 1, 2], shape=(n_reduced - 2, n_reduced),  # type: ignore[reportArgumentType]
         )
         penalty = penalty + lam2 * (D2.T @ D2)
 
@@ -151,151 +134,7 @@ def _fit_pspline(
     c = R @ c_reduced
 
     spline = BSpline(knots, c, degree, extrapolate=False)
-    # Cast to float64 before clipping: a float32 `x` (e.g. breakpoints derived from
-    # a float32 tof2mz array) clips to a float32-rounded `lo`/`hi`, which can land a
-    # few ULPs outside the spline's float64 knot domain and trigger NaN from
-    # `extrapolate=False`'s strict domain check.
-    return lambda x: spline(np.clip(np.asarray(x, dtype=np.float64), lo, hi))
-
-
-def fit_correction(
-    df: pd.DataFrame, config: dict, weights: np.ndarray | None = None,
-) -> Callable[[np.ndarray], np.ndarray]:
-    """Fit a ppm-error-vs-m/z correction function.
-
-    `config["model"]` (plain if/elif, no dynamic import) selects between:
-    - `"global_median"`: a single constant.
-    - `"binned_median"`: m/z-binned median, `np.interp`-ed between bin centers,
-      constant beyond the outermost bins.
-    - `"pspline_derivative_penalized"`: see below.
-    - `"natural_cubic_spline"`: smoother than `binned_median`'s jagged line, but an
-      exact interpolant prone to Runge's-phenomenon oscillation between sparse/noisy
-      nodes -- see `"pspline_derivative_penalized"` for a non-oscillating alternative.
-    - `"xgboost_derivative_penalized"`: see below.
-
-    Every occupied bin is used as a node regardless of count -- no minimum-count
-    threshold -- since `np.interp`/the spline already hold the nearest node's value
-    constant past the edges, so a sparse edge bin degrades gracefully.
-
-    `"pspline_derivative_penalized"` (`_fit_pspline`) fits a genuine penalized
-    B-spline directly on the raw (not binned-median) data: dense interior knots
-    every `bin_width_da`, `config["lam1"]`/`config["lam2"]` (default `0.0`)
-    penalizing first/second differences between adjacent coefficients, boundary
-    coefficient pairs tied so the curve flattens (zero first derivative) at both
-    ends. Unlike `"natural_cubic_spline"` this doesn't oscillate between
-    sparse/noisy nodes (e.g. a pooled precursor+fragment fit, where fragments extend
-    well past the precursor m/z range) while staying C2-continuous throughout --
-    unlike `_derivative_penalized_smooth`-based approaches, which penalize discrete
-    node values joined by straight lines (only C0, visible kinks), this penalizes
-    spline coefficients directly.
-
-    `"natural_cubic_spline"` bins like `binned_median` (`bin_width_da`), groups bins
-    3-wide, takes each group's median as a node, then fits a cubic spline through
-    those nodes with the first derivative clamped to zero at both ends (flattens
-    smoothly beyond the outermost node, evaluated by clipping input m/z into the
-    node range first). Nothing constrains the curve *between* nodes, so
-    uneven/sparse spacing can make it swing wildly well inside the fitted range.
-
-    `"xgboost_derivative_penalized"` bins like `binned_median`, but each node's
-    y-value is an `XGBRegressor` prediction at the bin center (fit once on every
-    row, not per-bin) rather than a plain median, so nodes can capture nonlinear
-    structure a median can't. Those predicted nodes are then smoothed by
-    `_derivative_penalized_smooth` (`config["lam"]`, weighted by bin occupancy)
-    before `np.interp` -- the derivative penalty is what keeps the curve smooth
-    despite xgboost's flexibility. `config["xgboost_kwargs"]` overrides
-    `XGBRegressor`'s defaults (`n_estimators=200, max_depth=3, learning_rate=0.05,
-    reg_lambda=1.0`).
-
-    `weights` (optional, one entry per `df` row) turns every median above into a
-    weighted median (and feeds `XGBRegressor.fit`'s `sample_weight`) -- node/bin
-    *placement* stays an unweighted median of `precursor_mz`, only the fitted `ppm`
-    value is reweighted. `None` (default) reproduces the unweighted behavior exactly.
-    """
-    model = config["model"]
-    ppm = df["precursor_ppm"].to_numpy()
-
-    if model == "global_median":
-        offset = float(np.median(ppm)) if weights is None else _weighted_median(ppm, weights)
-        return lambda mz: np.full_like(np.asarray(mz, dtype=np.float64), offset)
-
-    if model == "binned_median":
-        mz = df["precursor_mz"].to_numpy()
-        bin_width = config["bin_width_da"]
-        bin_idx = np.floor(mz / bin_width).astype(np.int64)
-        if weights is None:
-            bin_medians = pd.DataFrame({"bin": bin_idx, "ppm": ppm}).groupby("bin")["ppm"].median().sort_index()
-        else:
-            bin_medians = (
-                pd.DataFrame({"bin": bin_idx, "ppm": ppm, "weight": weights})
-                .groupby("bin")
-                .apply(lambda g: _weighted_median(g["ppm"].to_numpy(), g["weight"].to_numpy()))
-                .sort_index()
-            )
-        bin_centers = (bin_medians.index.to_numpy() + 0.5) * bin_width
-        return lambda mz: np.interp(mz, bin_centers, bin_medians.to_numpy())
-
-    if model == "pspline_derivative_penalized":
-        mz = df["precursor_mz"].to_numpy()
-        bin_width = config["bin_width_da"]
-        lam1 = config.get("lam1", 0.0)
-        lam2 = config.get("lam2", 0.0)
-        degree = config.get("degree", 3)
-        weight = np.ones_like(ppm) if weights is None else weights
-        return _fit_pspline(mz, ppm, weight, bin_width, lam1, lam2, degree)
-
-    if model == "natural_cubic_spline":
-        mz = df["precursor_mz"].to_numpy()
-        bin_width = config["bin_width_da"]
-        bin_idx = np.floor(mz / bin_width).astype(np.int64)
-        n_bins = len(np.unique(bin_idx))
-        n_knots = max(4, n_bins // 3)
-
-        wide_bin_width = (mz.max() - mz.min()) / n_knots
-        wide_bin_idx = np.floor((mz - mz.min()) / wide_bin_width).astype(np.int64)
-        if weights is None:
-            nodes = (
-                pd.DataFrame({"bin": wide_bin_idx, "mz": mz, "ppm": ppm})
-                .groupby("bin")
-                .median()
-                .sort_values("mz")
-            )
-        else:
-            grouped = pd.DataFrame(
-                {"bin": wide_bin_idx, "mz": mz, "ppm": ppm, "weight": weights}
-            ).groupby("bin")
-            nodes = pd.DataFrame({
-                "mz": grouped["mz"].median(),
-                "ppm": grouped.apply(lambda g: _weighted_median(g["ppm"].to_numpy(), g["weight"].to_numpy())),
-            }).sort_values("mz")
-        node_mz = nodes["mz"].to_numpy()
-        node_ppm = nodes["ppm"].to_numpy()
-        spline = CubicSpline(node_mz, node_ppm, bc_type=((1, 0.0), (1, 0.0)))
-        lo, hi = node_mz.min(), node_mz.max()
-        return lambda mz: spline(np.clip(mz, lo, hi))
-
-    if model == "xgboost_derivative_penalized":
-        mz = df["precursor_mz"].to_numpy()
-        bin_width = config["bin_width_da"]
-        lam = config["lam"]
-        xgb_kwargs = {
-            "n_estimators": 200,
-            "max_depth": 3,
-            "learning_rate": 0.05,
-            "reg_lambda": 1.0,
-            **config.get("xgboost_kwargs", {}),
-        }
-
-        regressor = XGBRegressor(**xgb_kwargs)
-        regressor.fit(mz.reshape(-1, 1), ppm, sample_weight=weights)
-
-        bin_idx = np.floor(mz / bin_width).astype(np.int64)
-        counts = pd.Series(bin_idx).value_counts().sort_index()
-        bin_centers = (counts.index.to_numpy() + 0.5) * bin_width
-        node_ppm = regressor.predict(bin_centers.reshape(-1, 1))
-        smoothed = _derivative_penalized_smooth(node_ppm, counts.to_numpy(dtype=np.float64), lam)
-        return lambda mz: np.interp(mz, bin_centers, smoothed)
-
-    raise ValueError(f"unknown recalibration model: {model!r}")
+    return spline, lo, hi
 
 
 def fit_additive_correction(
@@ -383,7 +222,7 @@ def fit_additive_correction(
         regressor.fit(feature_df, y, sample_weight=weights)
         booster = regressor.get_booster()
 
-        medians = {d: float(df[d].median()) for d in dims}
+        medians = {d: float(np.median(df[d].to_numpy())) for d in dims}
         train_contribs = booster.predict(DMatrix(feature_df), pred_contribs=True)
         bias = float(np.mean(train_contribs[:, -1]))  # row-invariant base-score term
 
@@ -422,243 +261,128 @@ def fit_additive_correction(
                     if other != d:
                         others_sum += fitted_values[other]
                 partial_residual = y - intercept - others_sum
-                raw_component = _fit_pspline(
+                spline, lo, hi = _fit_pspline(
                     columns[d], partial_residual, weight, bin_width_da, lam1, lam2, degree
                 )
-                raw_values = raw_component(columns[d])
+                raw_values = spline(np.clip(columns[d], lo, hi))
                 mean_d = float(np.average(raw_values, weights=weight))
                 fitted_values[d] = raw_values - mean_d
                 # f/delta default args (not a closure over the loop variables by
                 # reference) so each dimension's lambda keeps its own round's
-                # values, not whatever raw_component/mean_d end up as after the
+                # values, not whatever spline/lo/hi/mean_d end up as after the
                 # loop finishes (the classic late-binding closure bug).
-                components[d] = lambda x, f=raw_component, delta=mean_d: f(x) - delta
+                components[d] = (
+                    lambda x, f=spline, l=lo, h=hi, delta=mean_d: f(np.clip(x, l, h)) - delta
+                )
 
         return components, intercept
 
     raise ValueError(f"unknown additive recalibration model: {model!r}")
 
 
-def _plot_recalibration_fit(
-    plot_path: str | Path,
-    precursor_mz: np.ndarray,
-    precursor_ppm: np.ndarray,
-    fragment_mz: np.ndarray,
-    fragment_ppm: np.ndarray,
-    precursor_correction: Callable[[np.ndarray], np.ndarray],
-    fragment_correction: Callable[[np.ndarray], np.ndarray],
-    config: dict,
-) -> None:
-    """Scatter both precursor and fragment ppm-error clouds plus each type's own
-    fitted trendline (still 1D -- every current model regresses ppm against m/z
-    alone). When `fit_separately` is off, `precursor_correction`/`fragment_correction`
-    are the same object (see `recalibrate()`) so the two lines coincide."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ax.scatter(
-        fragment_mz, fragment_ppm,
-        s=2, alpha=0.15, color="#E69F00", linewidths=0,
-        label=f"fragments (n={len(fragment_mz):_})",
-    )
-    ax.scatter(
-        precursor_mz, precursor_ppm,
-        s=4, alpha=0.35, color="#0072B2", linewidths=0,
-        label=f"precursors (n={len(precursor_mz):_})",
-    )
-
-    fragment_line_mz = np.linspace(fragment_mz.min(), fragment_mz.max(), 400)
-    ax.plot(
-        fragment_line_mz, fragment_correction(fragment_line_mz),
-        color="black", linewidth=2.5, linestyle="--" if fragment_correction is not precursor_correction else "-",
-        label="fitted correction (fragments)" if fragment_correction is not precursor_correction else "fitted correction",
-    )
-    if fragment_correction is not precursor_correction:
-        precursor_line_mz = np.linspace(precursor_mz.min(), precursor_mz.max(), 400)
-        ax.plot(
-            precursor_line_mz, precursor_correction(precursor_line_mz),
-            color="black", linewidth=2.5, linestyle="-",
-            label="fitted correction (precursors)",
-        )
-    ax.axhline(0, color="#808080", linewidth=1, linestyle=":")
-    ax.set_xlabel("m/z")
-    ax.set_ylabel("ppm error")
-    ax.legend(fontsize=9, loc="best")
-    ax.set_title(
-        f"Recalibration fit -- model={config['model']}, "
-        f"tolerance_percentiles={config['tolerance_percentiles']}"
-    )
-    fig.tight_layout()
-
-    plot_path = Path(plot_path)
-    plot_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(plot_path, dpi=300)
-    plt.close(fig)
+def _tolerance(residual: np.ndarray, percentiles: tuple[float, float]) -> dict:
+    lo_pct, hi_pct = percentiles
+    return {"ppm": [float(np.percentile(residual, lo_pct)), float(np.percentile(residual, hi_pct))]}
 
 
-def _correction_dim(
-    correction: Callable[[np.ndarray], np.ndarray],
-    lo: float, hi: float, n_grid: int,
-) -> EvenlySpacedLinearSpline:
-    """Sample a `fit_correction()`-style closure on an evenly spaced grid spanning
-    `[lo, hi]`. `lo`/`hi` should cover the full range this will ever be queried at,
-    not just the range it was fit on -- e.g. in `recalibrate()`, the union of the
-    fitting data's own m/z range and the full `tof2mz` lookup table's range, since
-    the latter can extend further. Whatever `correction` does beyond its own fitted
-    range (hold constant, taper flat, etc.) carries through automatically, since
-    the grid values come from calling `correction`, not reimplemented here.
-    """
-    breakpoints = np.linspace(lo, hi, n_grid)
-    values = np.asarray(correction(breakpoints), dtype=np.float64)
-    return EvenlySpacedLinearSpline(float(lo), float(hi), values)
-
-
-def to_numba_correction(
-    correction: Callable[[np.ndarray], np.ndarray],
-    mz_lo: float, mz_hi: float, n_grid: int = 2000,
-) -> Callable[[float], float]:
-    """Distill any `fit_correction()`-style closure into a numba `@njit` scalar
-    function via `EvenlySpacedLinearSpline` -- none of `CubicSpline`/`BSpline`/
-    `XGBRegressor` are numba-callable themselves, but every model reduces to a
-    plain array-in-array-out function, so grid-sampling it works uniformly
-    regardless of which model produced it.
-    """
-    return _correction_dim(correction, mz_lo, mz_hi, n_grid).njit_evaluator()
-
-
-@numba.njit(parallel=True, nogil=True)
-def _apply_numba_correction(mz_array: np.ndarray, corrector) -> np.ndarray:
-    """Apply a `to_numba_correction()` scalar corrector to a whole array, in
-    parallel -- used wherever `recalibrate()` needs array-in-array-out behavior
-    (residuals, `tof2mz`, the plot); the scalar `corrector` itself is what's meant
-    for embedding directly in other multithreaded numba code.
-    """
-    out = np.empty(mz_array.shape, dtype=np.float64)
-    for i in numba.prange(mz_array.shape[0]):
-        out[i] = corrector(mz_array[i])
-    return out
-
-
-def recalibrate(
+def recalibrate_pmsms_mz(
     sage_results_tsv: str | Path,
     matched_fragments: str | Path,
-    fragment_mz_min: float,
-    fragment_mz_max: float,
+    mz_pmsms: str | Path,
     config: dict,
     fdr: float,
+    output_pmsms: str | Path,
     mz_recalibration_path: str | Path,
-    plot_path: str | Path | None = None,
+    plot_path: str | Path,
 ) -> dict:
-    """Fit the ppm correction from confident PSMs and dump it as an `MzRecalibration`
-    artifact (fragments only -- precursor mz gets its own separate correction step,
-    done elsewhere by `recalibrate-precursor-mz`).
-
-    By default one `fit_correction` model is fit on precursor and fragment (mz,
-    ppm) data pooled together -- fragment residuals via `matched_fragments.sage.tsv`'s
-    `fragment_mz_experimental`/`fragment_mz_calculated`, since Sage's own per-PSM
-    `fragment_ppm` is an intensity-weighted mean of *absolute* error and can't give
-    a signed residual. Pooling means the fit's domain spans the *union* of
-    precursor and fragment m/z, so it doesn't silently extrapolate past its own
-    training range.
-
-    `fragment_mz_min`/`fragment_mz_max` extend that domain to the full range the
-    fitted correction will later be queried at (e.g. `MzPmsms`'s actual materialized
-    `mz` column range, not just the confident-PSM subset's range) -- same role the
-    old dense `tof2mz` array's min/max used to play, without needing the whole array.
-
-    `config["fit_separately"]` (default `False`) fits the same model/hyperparameters
-    independently on precursor-only and fragment-only data instead -- two correctors,
-    each responsible only for its own residuals; the dumped artifact always uses the
-    fragment corrector. `precursor_tol`/`fragment_tol` are both
-    `config["tolerance_percentiles"]` applied to each type's own residual, so the two
-    windows can differ even pooled.
-
-    `plot_path`, if given, saves a diagnostic plot (`_plot_recalibration_fit`) from
-    this exact fit -- no re-reading or re-fitting.
-
-    `mz_recalibration_path` always receives the fragment corrector's own grid as an
-    `MzRecalibration` artifact (dimension `"mz"`, `bias=0.0`) -- the sole output of
-    fitting; applying it to any given `mz` value is a separate step, done elsewhere
-    (`timstofu`'s `recalibrate_pmsms_mz`).
-
-    Every corrector is immediately distilled via `EvenlySpacedLinearSpline`/
-    `to_numba_correction` and used as that from here on -- one numba code path by
-    default, so whatever this fits is already in a form other numba-compiled
-    pipeline code can embed directly.
+    """Fit `config["fragment_model"]` on confident-PSM fragment residuals, grid-sample
+    it into an `MzRecalibration` artifact, and apply it to `mz_pmsms`'s `mz` column in
+    one pass, writing `output_pmsms` directly. The grid artifact is the sole
+    serialization of the fit -- no separate raw-model dump for fragments.
     """
-    df = filter_top_psms(sage_results_tsv, fdr)
-    fragments = _confident_matched_fragments(matched_fragments, df["psm_id"])
+    from mmappet.fs import copy_dataset
+    from timstofu.timstofmisc import apply_mz_recalibration
 
-    precursor_mz = df["precursor_mz"].to_numpy()
-    precursor_ppm = df["precursor_ppm"].to_numpy()
+    from searchops.models import build_model
+
+    df = filter_top_psms(sage_results_tsv, fdr)
+    fragments = _confident_matched_fragments(matched_fragments, pd.Series(df["psm_id"]))
     fragment_mz = fragments["fragment_mz_experimental"].to_numpy()
     fragment_ppm = fragments["fragment_ppm"].to_numpy()
 
+    model = build_model(config["fragment_model"]).fit(fragment_mz, fragment_ppm)
+
+    mz_pmsms = Path(mz_pmsms)
+    output_pmsms = Path(output_pmsms)
+    if output_pmsms.exists():
+        raise FileExistsError(f"{output_pmsms} already exists")
+    schema = mmappet.str_to_schema((mz_pmsms / "schema.txt").read_text())
+    columns = list(schema.columns)
+    mz_idx = columns.index("mz")
+
+    input_ds = mmappet.open_dataset_dct(mz_pmsms)
+    raw_mz = input_ds["mz"]
+
     n_grid = config.get("numba_grid_points", 2000)
+    mz_lo = min(float(fragment_mz.min()), float(np.min(raw_mz)))
+    mz_hi = max(float(fragment_mz.max()), float(np.max(raw_mz)))
+    breakpoints = np.linspace(mz_lo, mz_hi, n_grid)
+    grid_dim = EvenlySpacedLinearSpline(mz_lo, mz_hi, model.predict(breakpoints))
+    MzRecalibration(dims={"mz": grid_dim}).dump(mz_recalibration_path)
+    corrector = grid_dim.njit_evaluator()
 
-    def build_correction(fitted, mz_lo, mz_hi):
-        dim = _correction_dim(fitted, mz_lo, mz_hi, n_grid)
-        numba_correction = dim.njit_evaluator()
-        apply = lambda mz: _apply_numba_correction(np.asarray(mz, dtype=np.float64), numba_correction)
-        return apply, dim
+    fell_back = copy_dataset(mz_pmsms, output_pmsms, skip={f"{mz_idx}.bin"})
+    if fell_back:
+        print(
+            f"warning: hard-link failed for one or more files under {mz_pmsms}; "
+            "fell back to copy (uses extra disk space)",
+            file=sys.stderr,
+        )
+    mz_path = output_pmsms / f"{mz_idx}.bin"
+    with open(mz_path, "xb") as f:
+        f.truncate(len(raw_mz) * raw_mz.dtype.itemsize)
+    output_ds = mmappet.open_dataset_dct(output_pmsms, read_write=True)
+    with ProgressBar(total=len(raw_mz), desc="recalibrate_pmsms_mz: applying correction") as progress:
+        apply_mz_recalibration(raw_mz, corrector, 0.0, output_ds["mz"], progress)
 
-    if config.get("fit_separately", False):
-        precursor_fit = fit_correction(
-            pd.DataFrame({"precursor_mz": precursor_mz, "precursor_ppm": precursor_ppm}), config
-        )
-        fragment_fit = fit_correction(
-            pd.DataFrame({"precursor_mz": fragment_mz, "precursor_ppm": fragment_ppm}), config
-        )
-        precursor_correction, _precursor_dim = build_correction(
-            precursor_fit, precursor_mz.min(), precursor_mz.max()
-        )
-        fragment_correction, fragment_dim = build_correction(
-            fragment_fit, min(fragment_mz.min(), fragment_mz_min), max(fragment_mz.max(), fragment_mz_max)
-        )
-    else:
-        pooled_df = pd.DataFrame({
-            "precursor_mz": np.concatenate([precursor_mz, fragment_mz]),
-            "precursor_ppm": np.concatenate([precursor_ppm, fragment_ppm]),
-        })
-        fitted_correction = fit_correction(pooled_df, config)
-        shared_correction, fragment_dim = build_correction(
-            fitted_correction,
-            min(pooled_df["precursor_mz"].min(), fragment_mz_min),
-            max(pooled_df["precursor_mz"].max(), fragment_mz_max),
-        )
-        precursor_correction = shared_correction
-        fragment_correction = shared_correction
+    model.plot_fit(plot_path, fragment_mz, fragment_ppm, title="Fragment m/z recalibration fit")
 
-    residual_precursor_ppm = precursor_ppm - precursor_correction(precursor_mz)
-    residual_fragment_ppm = fragment_ppm - fragment_correction(fragment_mz)
-    lo_pct, hi_pct = config["tolerance_percentiles"]
-    precursor_tol = [
-        float(np.percentile(residual_precursor_ppm, lo_pct)),
-        float(np.percentile(residual_precursor_ppm, hi_pct)),
-    ]
-    fragment_tol = [
-        float(np.percentile(residual_fragment_ppm, lo_pct)),
-        float(np.percentile(residual_fragment_ppm, hi_pct)),
-    ]
+    residual = fragment_ppm - model.predict(fragment_mz)
+    return _tolerance(residual, config["tolerance_percentiles"])
 
-    if plot_path is not None:
-        _plot_recalibration_fit(
-            plot_path,
-            precursor_mz, precursor_ppm,
-            fragment_mz, fragment_ppm,
-            precursor_correction, fragment_correction,
-            config,
-        )
 
-    MzRecalibration(dims={"mz": fragment_dim}).dump(mz_recalibration_path)
+def recalibrate_precursors(
+    sage_results_tsv: str | Path,
+    precursors: str | Path,
+    config: dict,
+    fdr: float,
+    output_precursors: str | Path,
+    plot_path: str | Path,
+    model_path: str | Path,
+) -> dict:
+    """Fit `config["precursor_model"]` on confident-PSM precursor residuals and
+    apply it directly to `precursors`'s `mz` column, writing `output_precursors`.
+    """
+    from searchops.models import build_model
 
-    tolerance = {
-        "precursor_tol": {"ppm": precursor_tol},
-        "fragment_tol": {"ppm": fragment_tol},
-    }
-    return tolerance
+    df = filter_top_psms(sage_results_tsv, fdr)
+    precursor_mz = df["precursor_mz"].to_numpy()
+    precursor_ppm = df["precursor_ppm"].to_numpy()
+
+    model = build_model(config["precursor_model"]).fit(precursor_mz, precursor_ppm)
+
+    precursors_df = mmappet.open_dataset(Path(precursors))
+    precursors_df = precursors_df.rename(columns={"mz": "mz_old"})
+    old_mz = precursors_df["mz_old"].to_numpy()
+    precursors_df["mz"] = old_mz / (1.0 + model.predict(old_mz) * 1e-6)
+    with mmappet.DatasetWriter(Path(output_precursors), overwrite_dir=True) as writer:
+        writer.append_df(precursors_df)
+
+    model.plot_fit(plot_path, precursor_mz, precursor_ppm, title="Precursor m/z recalibration fit")
+    model.save(model_path)
+
+    residual = precursor_ppm - model.predict(precursor_mz)
+    return _tolerance(residual, config["tolerance_percentiles"])
 
 
 def _hist_panel(ax, before, after, lo_tol, hi_tol, xlabel, title) -> None:
@@ -684,25 +408,23 @@ def plot_recalibrated_ppm(
     sage_results_tsv: str | Path,
     initial_matched_fragments: str | Path,
     matched_fragments: str | Path,
-    tolerance: dict,
+    precursor_tolerance: dict,
+    fragment_tolerance: dict,
     fdr: float,
     plot_path: str | Path,
 ) -> None:
     """Two-panel plot: marginal `precursor_ppm` (top) and `fragment_ppm` (bottom)
-    distributions, both unconditional on m/z (plain 1D histograms, unlike
-    `_plot_recalibration_fit`'s scatter-vs-mz), overlaid before vs. after
+    distributions, both unconditional on m/z, overlaid before vs. after
     recalibration.
 
-    `initial_sage_results_tsv`/`initial_matched_fragments` are the *first* SAGE
-    pass's outputs -- the uncorrected search on `recalibration_precursor_selection`'s
-    subset, the same data `recalibrate()` fits from. `sage_results_tsv`/
-    `matched_fragments` are the *second*, final pass's outputs -- full precursor
-    population, already searched with the corrected tof2mz/tolerances baked in.
-    These don't share a precursor population (subset vs. full), so each panel is a
+    `initial_sage_results_tsv`/`initial_matched_fragments` are the first SAGE
+    pass's outputs (uncorrected search); `sage_results_tsv`/`matched_fragments`
+    are the second, final pass's (full precursor population, corrected mz/
+    tolerances baked in) -- different precursor populations, so each panel is a
     shape/spread comparison, not a paired one.
 
-    `tolerance["precursor_tol"]["ppm"]`/`["fragment_tol"]["ppm"]` (the dict
-    `recalibrate()` returned, that the second pass actually ran with) are drawn as
+    `precursor_tolerance["ppm"]`/`fragment_tolerance["ppm"]` (from
+    `recalibrate_precursors`/`recalibrate_pmsms_mz` respectively) are drawn as
     reference bands.
     """
     import matplotlib
@@ -715,14 +437,14 @@ def plot_recalibrated_ppm(
     final_precursor_ppm = final_df["precursor_ppm"].to_numpy()
 
     initial_fragment_ppm = _confident_matched_fragments(
-        initial_matched_fragments, initial_df["psm_id"]
+        initial_matched_fragments, pd.Series(initial_df["psm_id"])
     )["fragment_ppm"].to_numpy()
     final_fragment_ppm = _confident_matched_fragments(
-        matched_fragments, final_df["psm_id"]
+        matched_fragments, pd.Series(final_df["psm_id"])
     )["fragment_ppm"].to_numpy()
 
-    precursor_lo, precursor_hi = tolerance["precursor_tol"]["ppm"]
-    fragment_lo, fragment_hi = tolerance["fragment_tol"]["ppm"]
+    precursor_lo, precursor_hi = precursor_tolerance["ppm"]
+    fragment_lo, fragment_hi = fragment_tolerance["ppm"]
 
     fig, (ax_precursor, ax_fragment) = plt.subplots(2, 1, figsize=(10, 10))
     _hist_panel(
