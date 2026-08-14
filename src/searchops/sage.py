@@ -39,7 +39,7 @@ def summarize_sage(
         # field contains embedded newlines that confuse the column count.
         source = f"read_csv('{path}', delim='\t', header=true, quote='', ignore_errors=true)"
 
-    con.execute(f"CREATE VIEW sage AS SELECT * FROM {source} WHERE {q} <= {fdr}")
+    con.execute(f"CREATE VIEW sage AS SELECT * FROM {source} WHERE {q} <= {fdr} AND label = 1")
     psm_count = con.execute("SELECT COUNT(*) FROM sage").fetchone()[0]
     peptide_count = con.execute("SELECT COUNT(DISTINCT peptide) FROM sage").fetchone()[0]
     ion_count = con.execute(
@@ -74,7 +74,7 @@ def count_sage_at_fdr(
 
     con = duckdb.connect()
     con.register("sage_raw", df)
-    con.execute(f"CREATE VIEW sage AS SELECT * FROM sage_raw WHERE {q} <= {fdr}")
+    con.execute(f"CREATE VIEW sage AS SELECT * FROM sage_raw WHERE {q} <= {fdr} AND label = 1")
     psm_count = con.execute("SELECT COUNT(*) FROM sage").fetchone()[0]
     peptide_count = con.execute("SELECT COUNT(DISTINCT peptide) FROM sage").fetchone()[0]
     ion_count = con.execute(
