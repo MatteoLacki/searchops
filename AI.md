@@ -94,6 +94,37 @@ back by SAGE and all remaining (unmatched) fragments.
 
 **Key dependencies**: `mmappet`, `kilograms`, `plotnine`, `scipy.ndimage`.
 
+## `recalibration.py` — mz recalibration, `[mz]`-scoped tolerance (2026-08-25)
+
+`recalibrate_pmsms_mz`/`recalibrate_precursors` fit `config["fragment_model"]`/
+`config["precursor_model"]` (unchanged, `searchops.models.build_model`) and derive
+a tolerance window from the fit residual via `_select_tolerance(residual,
+config["mz"])` — reads `config["mz"]["tolerance_percentiles"]` and
+`config["mz"].get("tolerance_method", "theoretic")`. Previously read
+`config["tolerance_percentiles"]` off the config root; moved into its own `[mz]`
+table so mz's percentiles/method are independently configurable from RT/IIM's
+(`git/featureprediction`'s own `[rt]`/`[iim]` equivalents), not implicitly shared
+just by sitting at the same nesting level. `fragment_model`/`precursor_model`
+stay at the config root — only `tolerance_percentiles`/`tolerance_method` moved.
+Design/history: `plans/lda_external_rt_iim_features.md`.
+
+`"theoretic"` (default) — `_symmetric_tolerance`, `median ± z·robust_sigma`
+(`z = norm.ppf(hi_pct/100)`), mirrors `feature_prediction.tolerance.
+symmetric_gaussian_tolerance` exactly (separate implementation, not a shared
+import — different package). `"empiric"` — `_tolerance`, the original plain
+empirical percentiles (kept, still used when explicitly selected). Default
+changed to theoretic because real F9477 precursor mass-error residuals are
+visibly right-skewed, mostly a truncation artifact of the calibration pass's
+own fixed search window rather than genuine distribution shape worth chasing
+with an asymmetric window.
+
+**`tests/test_recalibration.py` is currently broken independent of this
+change** — found while adding tests here, not caused by it: it imports
+`recalibrate` from this module, which doesn't exist (only
+`recalibrate_pmsms_mz`/`recalibrate_precursors` do — likely stale from a prior
+split/rename this test file never followed). Left as-is; new coverage for the
+tolerance-selection change lives in `tests/test_tolerance_selection.py` instead.
+
 ## Adding a new CLI tool
 
 1. Add `src/searchops/cli/<name>.py` with a `main()` entry point.

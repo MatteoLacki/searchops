@@ -19,6 +19,7 @@ from numba_progress import ProgressBar
 from scipy.interpolate import BSpline
 from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import spsolve
+from scipy.stats import norm
 from xgboost import DMatrix, XGBRegressor
 
 from pandas_ops.io import read_df
@@ -285,6 +286,48 @@ def _tolerance(residual: np.ndarray, percentiles: tuple[float, float]) -> dict:
     return {"ppm": [float(np.percentile(residual, lo_pct)), float(np.percentile(residual, hi_pct))]}
 
 
+def _robust_sigma(residual: np.ndarray) -> float:
+    """MAD-based robust scale estimate (`1.4826 * median(|x - median(x)|)`)
+    -- mirrors `feature_prediction.tolerance.robust_sigma` (kept as a
+    separate implementation, not a cross-package import, same reasoning as
+    that module's own docstring for not sharing code with SAGE's Rust
+    `LinearSpline`: different package, no shared dependency to hang it on).
+    """
+    residual = np.asarray(residual, dtype=np.float64)
+    return float(1.4826 * np.median(np.abs(residual - np.median(residual))))
+
+
+def _symmetric_tolerance(residual: np.ndarray, percentiles: tuple[float, float]) -> dict:
+    """`median ± z * robust_sigma` (`z = norm.ppf(hi_pct / 100)`), symmetric
+    by construction -- mirrors `feature_prediction.tolerance.
+    symmetric_gaussian_tolerance`. Real F9477 precursor mass-error residuals
+    are visibly right-skewed (2026-08-25 finding), largely an artifact of
+    the fixed search window the calibration-pass anchors were drawn
+    through, not something an empirical-percentile window should chase.
+    """
+    lo_pct, hi_pct = percentiles
+    residual = np.asarray(residual, dtype=np.float64)
+    center = float(np.median(residual))
+    sigma = _robust_sigma(residual)
+    z = float(norm.ppf(hi_pct / 100.0))
+    return {"ppm": [center - z * sigma, center + z * sigma]}
+
+
+def _select_tolerance(residual: np.ndarray, mz_config: dict) -> dict:
+    """Dispatches on `mz_config["tolerance_method"]` (`"theoretic"`,
+    default, or `"empiric"`) -- mirrors
+    `feature_prediction.tolerance.select_tolerance`. `mz_config` is
+    `config["mz"]` (`{"tolerance_percentiles": [...], "tolerance_method": ...}`).
+    """
+    percentiles = tuple(mz_config["tolerance_percentiles"])
+    method = mz_config.get("tolerance_method", "theoretic")
+    if method == "theoretic":
+        return _symmetric_tolerance(residual, percentiles)
+    if method == "empiric":
+        return _tolerance(residual, percentiles)
+    raise ValueError(f"unknown tolerance method {method!r}, expected 'theoretic' or 'empiric'")
+
+
 def recalibrate_pmsms_mz(
     sage_results_tsv: str | Path,
     matched_fragments: str | Path,
@@ -348,7 +391,7 @@ def recalibrate_pmsms_mz(
     model.plot_fit(plot_path, fragment_mz, fragment_ppm, title="Fragment m/z recalibration fit")
 
     residual = fragment_ppm - model.predict(fragment_mz)
-    return _tolerance(residual, config["tolerance_percentiles"])
+    return _select_tolerance(residual, config["mz"])
 
 
 def recalibrate_precursors(
@@ -382,7 +425,7 @@ def recalibrate_precursors(
     model.save(model_path)
 
     residual = precursor_ppm - model.predict(precursor_mz)
-    return _tolerance(residual, config["tolerance_percentiles"])
+    return _select_tolerance(residual, config["mz"])
 
 
 def _hist_panel(ax, before, after, lo_tol, hi_tol, xlabel, title) -> None:
