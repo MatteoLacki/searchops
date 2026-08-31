@@ -125,6 +125,23 @@ change** — found while adding tests here, not caused by it: it imports
 split/rename this test file never followed). Left as-is; new coverage for the
 tolerance-selection change lives in `tests/test_tolerance_selection.py` instead.
 
+## `_symmetric_tolerance`: guard against `hi_pct` outside `(50, 100)` (2026-08-31)
+
+`z = norm.ppf(hi_pct / 100)` is `+inf` exactly at `hi_pct=100` and
+non-positive at `hi_pct<=50` — several real committed job configs (most with
+`tolerance_percentiles = [0, 100]`, a value that was only ever sane under the
+old default `"empiric"` method, before `"theoretic"` became the default) hit
+this and silently produced `{"ppm": [-inf, inf]}`, which then crashed three
+pipeline stages later as an opaque `invalid number` JSON-parse error in the
+SAGE fork, not here. Found via a real F9477 mode-3 run. `_symmetric_tolerance`
+now raises `ValueError` immediately if `hi_pct` isn't in `(50, 100)` — fails
+loud at the point of the actual mistake instead of downstream. Same fix
+applied to `feature_prediction.tolerance.symmetric_gaussian_tolerance`
+(separate package, same formula, independently discovered). No job config
+was mass-migrated off `[0, 100]` — only `jobs/f9477_mokapot_full.toml` (a new
+job) uses a sane `[1, 99]`; existing `[0, 100]` jobs will now fail fast with a
+clear message instead of a cryptic one, which is itself the improvement.
+
 ## Adding a new CLI tool
 
 1. Add `src/searchops/cli/<name>.py` with a `main()` entry point.

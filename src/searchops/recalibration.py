@@ -306,6 +306,12 @@ def _symmetric_tolerance(residual: np.ndarray, percentiles: tuple[float, float])
     through, not something an empirical-percentile window should chase.
     """
     lo_pct, hi_pct = percentiles
+    if not (50.0 < hi_pct < 100.0):
+        raise ValueError(
+            f"theoretic tolerance method needs hi_pct in (50, 100) -- "
+            f"z = norm.ppf(hi_pct/100) is +-inf/non-positive outside that range, "
+            f"got percentiles={percentiles!r}"
+        )
     residual = np.asarray(residual, dtype=np.float64)
     center = float(np.median(residual))
     sigma = _robust_sigma(residual)
