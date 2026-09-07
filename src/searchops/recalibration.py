@@ -20,7 +20,6 @@ from scipy.interpolate import BSpline
 from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import spsolve
 from scipy.stats import norm
-from xgboost import DMatrix, XGBRegressor
 
 from pandas_ops.io import read_df
 from timstofu.mzrecalibration import EvenlySpacedLinearSpline, MzRecalibration
@@ -164,22 +163,7 @@ def fit_additive_correction(
     component drops unmodified into `to_numba_correction(component, dim_lo, dim_hi,
     n_grid)` (summing/numba-wiring across dims is separate, later work).
 
-    `config["model"]`:
-
-    `"xgboost_additive"`: a single `XGBRegressor` with `max_depth` forced to `1`
-    across all `dims` -- depth-1 trees split on exactly one feature each, so the
-    ensemble sum is an *exact* additive decomposition (zero cross-terms) via
-    TreeSHAP (`booster.predict(DMatrix(...), pred_contribs=True)`; spot-checked to
-    ~1e-6 reconstruction error). Each component is a closure that builds a synthetic
-    grid (that dimension varying, every other held at its training-data median --
-    irrelevant to a depth-1 split on this dimension, so the placeholder only affects
-    robustness, not correctness) and reads off that dimension's SHAP column. Bias is
-    returned unfolded. `config["xgboost_kwargs"]` overrides the defaults
-    (`n_estimators=1200, learning_rate=0.03, subsample=0.8, reg_lambda=2.0` -- depth-1
-    trees need far more of them than `xgboost_derivative_penalized`'s depth-3
-    default); an explicit `max_depth != 1` raises `ValueError` rather than silently
-    breaking the additivity guarantee. No internal train/valid split or early
-    stopping -- a single fixed-round fit, fine for test-only/not-yet-pipeline-wired.
+    `config["model"]` (only `"pspline_additive"` is implemented):
 
     `"pspline_additive"`: classical Gauss-Seidel backfitting using `_fit_pspline` as
     the per-dimension smoother, `config.get("backfit_iters", 15)` passes over `dims`,
@@ -194,56 +178,14 @@ def fit_additive_correction(
     max-abs-change early exit would be a trivial future addition.
 
     `weights` (optional, one entry per `df` row) mirrors `fit_correction`'s own:
-    `None` means unweighted; otherwise it feeds `XGBRegressor.fit`'s `sample_weight`
-    or every weighted-mean/`_fit_pspline` call in the pspline branch.
+    `None` means unweighted; otherwise it feeds every weighted-mean/`_fit_pspline`
+    call.
     """
     if not dims:
         raise ValueError("dims must be non-empty")
     model = config["model"]
     y = df[target].to_numpy(dtype=np.float64)
     weight = np.ones_like(y) if weights is None else np.asarray(weights, dtype=np.float64)
-
-    if model == "xgboost_additive":
-        user_kwargs = config.get("xgboost_kwargs", {})
-        if "max_depth" in user_kwargs and user_kwargs["max_depth"] != 1:
-            raise ValueError(
-                "xgboost_additive requires max_depth=1 for the additive-decomposition "
-                f"guarantee to hold; got xgboost_kwargs['max_depth']={user_kwargs['max_depth']!r}"
-            )
-        xgb_kwargs = {
-            "n_estimators": 1200,
-            "learning_rate": 0.03,
-            "subsample": 0.8,
-            "reg_lambda": 2.0,
-            **user_kwargs,
-            "max_depth": 1,  # forced: see docstring
-        }
-
-        # A DataFrame (not a raw ndarray) so real column names attach to the
-        # booster -- needed so the later `DMatrix(grid_df)` predict-contribs calls
-        # don't hit a feature-names mismatch against anonymous f0/f1/... names.
-        feature_df = df[dims].astype(np.float64)
-        regressor = XGBRegressor(**xgb_kwargs)
-        regressor.fit(feature_df, y, sample_weight=weights)
-        booster = regressor.get_booster()
-
-        medians = {d: float(np.median(df[d].to_numpy())) for d in dims}
-        train_contribs = booster.predict(DMatrix(feature_df), pred_contribs=True)
-        bias = float(np.mean(train_contribs[:, -1]))  # row-invariant base-score term
-
-        def _make_component(dim_index: int, dim_name: str) -> Callable[[np.ndarray], np.ndarray]:
-            def component(x: np.ndarray) -> np.ndarray:
-                x = np.asarray(x, dtype=np.float64)
-                grid = np.empty((x.shape[0], len(dims)), dtype=np.float64)
-                for k, other in enumerate(dims):
-                    grid[:, k] = x if other == dim_name else medians[other]
-                grid_df = pd.DataFrame(grid, columns=dims)
-                contribs = booster.predict(DMatrix(grid_df), pred_contribs=True)
-                return contribs[:, dim_index]
-            return component
-
-        components = {d: _make_component(j, d) for j, d in enumerate(dims)}
-        return components, bias
 
     if model == "pspline_additive":
         bin_width_da = config["bin_width_da"]
