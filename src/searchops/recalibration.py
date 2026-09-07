@@ -298,6 +298,34 @@ def _select_tolerance(residual: np.ndarray, mz_config: dict) -> dict:
     raise ValueError(f"unknown tolerance method {method!r}, expected 'theoretic' or 'empiric'")
 
 
+def _plot_fragment_mz_fit(
+    path: str | Path, mz: np.ndarray, ppm: np.ndarray, bias: float, mz_component: Callable[[np.ndarray], np.ndarray],
+) -> None:
+    """Same style as `MzCorrectionModel.plot_fit`, but for a `fit_additive_correction`
+    component (a plain callable, not an `MzCorrectionModel` instance) plus its
+    separately-returned `bias`."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    mz = np.asarray(mz)
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.scatter(mz, ppm, s=3, alpha=0.2, color="#0072B2", linewidths=0, label=f"data (n={len(mz):_})")
+    line_x = np.linspace(mz.min(), mz.max(), 400)
+    ax.plot(line_x, bias + mz_component(line_x), color="black", linewidth=2.5, label="fitted correction")
+    ax.axhline(0, color="#808080", linewidth=1, linestyle=":")
+    ax.set_xlabel("m/z")
+    ax.set_ylabel("ppm error")
+    ax.legend(fontsize=9, loc="best")
+    ax.set_title("Fragment m/z recalibration fit")
+    fig.tight_layout()
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+
 def recalibrate_pmsms_mz(
     sage_results_tsv: str | Path,
     matched_fragments: str | Path,
@@ -309,15 +337,26 @@ def recalibrate_pmsms_mz(
     mz_recalibration_path: str | Path,
     plot_path: str | Path,
 ) -> dict:
-    """Fit `config["fragment_model"]` on confident-PSM fragment residuals as a
-    function of the fragment's own m/z, then fit a second, sequential term on
-    the remaining residual as a function of the fragment's *parent
-    precursor's* RT (`f_mz(fragment_mz) + f_rt(precursor_rt)` -- a per-spectrum
-    additive shift, since every fragment of one spectrum shares its
-    precursor's RT). Grid-samples both into one `MzRecalibration` artifact
-    (`dims={"mz": ..., "rt": ...}`) and applies their sum to `mz_pmsms`'s `mz`
-    column in one pass, writing `output_pmsms` directly. The grid artifact is
-    the sole serialization of the fit -- no separate raw-model dump.
+    """Fit `f_mz(fragment_mz) + f_rt(precursor_rt)` jointly on confident-PSM
+    fragment residuals via `fit_additive_correction`'s `pspline_additive`
+    (real Gauss-Seidel backfitting, not a one-pass sequential approximation)
+    -- a per-spectrum additive shift, since every fragment of one spectrum
+    shares its precursor's RT. Grid-samples both fitted components into one
+    `MzRecalibration` artifact (`dims={"mz": ..., "rt": ...}`) and applies
+    their sum (plus the fit's own `bias`) to `mz_pmsms`'s `mz` column in one
+    pass, writing `output_pmsms` directly. The grid artifact is the sole
+    serialization of the fit -- no separate raw-model dump.
+
+    `config["fragment_model"]` must be `searchops.models.PSplineModel`-shaped
+    (`kwargs: {bin_width_da, lam1?, lam2?, degree?}`) -- backfitting jointly
+    refits both dims each round, so both need the same smoother family;
+    arbitrary `build_model` classes (e.g. `XGBoostDerivativePenalizedModel`)
+    aren't pluggable in here the way the mz-only fit used to allow. The mz
+    dim reuses `config["fragment_model"]["kwargs"]`'s `bin_width_da`/`lam1`/
+    `lam2`/`degree` verbatim; the rt dim gets its own `bin_width_da`
+    (`(fit_rt_hi - fit_rt_lo) / _FRAGMENT_RT_N_BINS`, since RT's ~0-8 minute
+    range needs a far finer bin width than mz's Da-scale one) via
+    `fit_additive_correction`'s per-dim `{dim: value}` config support.
 
     `precursors` (a `PreSageFilteredPrecursors`-shaped mmappet dataset) supplies
     both the RT-fit signal (joined onto confident-hit fragments via `psm_id`
@@ -332,21 +371,39 @@ def recalibrate_pmsms_mz(
     from mmappet.fs import copy_dataset
     from timstofu.timstofmisc import apply_mz_recalibration_mz_rt, broadcast_precursor_values_to_fragments
 
-    from searchops.models import PSplineModel, build_model
-
     df = filter_top_psms(sage_results_tsv, fdr)
     fragments = _confident_matched_fragments(matched_fragments, pd.Series(df["psm_id"]))
     fragment_mz = fragments["fragment_mz_experimental"].to_numpy()
     fragment_ppm = fragments["fragment_ppm"].to_numpy()
 
-    mz_model = build_model(config["fragment_model"]).fit(fragment_mz, fragment_ppm)
-    mz_residual = fragment_ppm - mz_model.predict(fragment_mz)
-
     rt_by_psm = df.set_index("psm_id")["rt"]
     fragment_rt = fragments["psm_id"].map(rt_by_psm).to_numpy(dtype=np.float64)
     fit_rt_lo, fit_rt_hi = float(fragment_rt.min()), float(fragment_rt.max())
     rt_bin_width = max((fit_rt_hi - fit_rt_lo) / _FRAGMENT_RT_N_BINS, 1e-6)
-    rt_model = PSplineModel(bin_width_da=rt_bin_width, lam1=100.0, lam2=100.0).fit(fragment_rt, mz_residual)
+
+    frag_model_cfg = config["fragment_model"]
+    if frag_model_cfg["class"] != "searchops.models.PSplineModel":
+        raise ValueError(
+            "recalibrate_pmsms_mz's joint mz+rt backfitting requires "
+            "config['fragment_model']['class'] == 'searchops.models.PSplineModel' "
+            f"(got {frag_model_cfg['class']!r})"
+        )
+    mz_kwargs = frag_model_cfg.get("kwargs", {})
+
+    fit_df = pd.DataFrame({"mz": fragment_mz, "rt": fragment_rt, "ppm": fragment_ppm})
+    components, bias = fit_additive_correction(
+        fit_df, dims=["mz", "rt"], target="ppm",
+        config={
+            "model": "pspline_additive",
+            "bin_width_da": {"mz": mz_kwargs["bin_width_da"], "rt": rt_bin_width},
+            "lam1": {"mz": mz_kwargs.get("lam1", 0.0), "rt": 100.0},
+            "lam2": {"mz": mz_kwargs.get("lam2", 0.0), "rt": 100.0},
+            "degree": {"mz": mz_kwargs.get("degree", 3), "rt": 3},
+            "backfit_iters": config.get("backfit_iters", 15),
+        },
+    )
+    mz_component = components["mz"]
+    rt_component = components["rt"]
 
     mz_pmsms = Path(mz_pmsms)
     output_pmsms = Path(output_pmsms)
@@ -364,19 +421,19 @@ def recalibrate_pmsms_mz(
     mz_lo = min(float(fragment_mz.min()), float(np.min(raw_mz)))
     mz_hi = max(float(fragment_mz.max()), float(np.max(raw_mz)))
     mz_breakpoints = np.linspace(mz_lo, mz_hi, n_grid)
-    grid_mz = EvenlySpacedLinearSpline(mz_lo, mz_hi, mz_model.predict(mz_breakpoints))
+    grid_mz = EvenlySpacedLinearSpline(mz_lo, mz_hi, mz_component(mz_breakpoints))
 
     precursors_ds = mmappet.open_dataset_dct(Path(precursors))
     # `precursors_ds["rt"]` is raw Bruker frame time (seconds, from
     # `timstofu.candidate_postprocessing.annotate`'s `frame2rt` lookup);
-    # `sage_results_tsv`'s own `rt` column (what `rt_model` was fit on, via
-    # `fragment_rt` above) is minutes -- convert here so both sides of the
-    # fit/apply split share one unit.
+    # `sage_results_tsv`'s own `rt` column (what `rt_component` was fit on,
+    # via `fragment_rt` above) is minutes -- convert here so both sides of
+    # the fit/apply split share one unit.
     precursor_rt = np.asarray(precursors_ds["rt"], dtype=np.float64) / 60.0
     precursor_rt = precursor_rt.astype(np.float32)
     all_rt_lo, all_rt_hi = float(np.min(precursor_rt)), float(np.max(precursor_rt))
     rt_breakpoints = np.linspace(all_rt_lo, all_rt_hi, n_grid)
-    grid_rt = EvenlySpacedLinearSpline(all_rt_lo, all_rt_hi, rt_model.predict(rt_breakpoints))
+    grid_rt = EvenlySpacedLinearSpline(all_rt_lo, all_rt_hi, rt_component(rt_breakpoints))
 
     MzRecalibration(dims={"mz": grid_mz, "rt": grid_rt}).dump(mz_recalibration_path)
     corrector_mz = grid_mz.njit_evaluator()
@@ -403,12 +460,12 @@ def recalibrate_pmsms_mz(
     output_ds = mmappet.open_dataset_dct(output_pmsms, read_write=True)
     with ProgressBar(total=n_fragments, desc="recalibrate_pmsms_mz: applying correction") as progress:
         apply_mz_recalibration_mz_rt(
-            raw_mz, rt_per_fragment, corrector_mz, corrector_rt, 0.0, output_ds["mz"], progress
+            raw_mz, rt_per_fragment, corrector_mz, corrector_rt, bias, output_ds["mz"], progress
         )
 
-    mz_model.plot_fit(plot_path, fragment_mz, fragment_ppm, title="Fragment m/z recalibration fit")
+    _plot_fragment_mz_fit(plot_path, fragment_mz, fragment_ppm, bias, mz_component)
 
-    residual = fragment_ppm - (mz_model.predict(fragment_mz) + rt_model.predict(fragment_rt))
+    residual = fragment_ppm - (bias + mz_component(fragment_mz) + rt_component(fragment_rt))
     return _select_tolerance(residual, config["mz"])
 
 
