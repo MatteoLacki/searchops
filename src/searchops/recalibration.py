@@ -27,6 +27,10 @@ from timstofu.mzrecalibration import EvenlySpacedLinearSpline, MzRecalibration
 
 PROTON_MASS = 1.00727646688
 
+# Internal choice, not a job-config knob -- mirrors feature_prediction's own
+# RT-tolerance-spline knot count precedent (docs/ai/predict_rt_iim.md).
+_FRAGMENT_RT_N_BINS = 10
+
 
 def filter_top_psms(sage_results_tsv: str | Path, fdr: float) -> pd.DataFrame:
     """Top-ranked, FDR-confident, target-only PSMs, with a `precursor_mz` column added.
@@ -338,28 +342,51 @@ def recalibrate_pmsms_mz(
     sage_results_tsv: str | Path,
     matched_fragments: str | Path,
     mz_pmsms: str | Path,
+    precursors: str | Path,
     config: dict,
     fdr: float,
     output_pmsms: str | Path,
     mz_recalibration_path: str | Path,
     plot_path: str | Path,
 ) -> dict:
-    """Fit `config["fragment_model"]` on confident-PSM fragment residuals, grid-sample
-    it into an `MzRecalibration` artifact, and apply it to `mz_pmsms`'s `mz` column in
-    one pass, writing `output_pmsms` directly. The grid artifact is the sole
-    serialization of the fit -- no separate raw-model dump for fragments.
+    """Fit `config["fragment_model"]` on confident-PSM fragment residuals as a
+    function of the fragment's own m/z, then fit a second, sequential term on
+    the remaining residual as a function of the fragment's *parent
+    precursor's* RT (`f_mz(fragment_mz) + f_rt(precursor_rt)` -- a per-spectrum
+    additive shift, since every fragment of one spectrum shares its
+    precursor's RT). Grid-samples both into one `MzRecalibration` artifact
+    (`dims={"mz": ..., "rt": ...}`) and applies their sum to `mz_pmsms`'s `mz`
+    column in one pass, writing `output_pmsms` directly. The grid artifact is
+    the sole serialization of the fit -- no separate raw-model dump.
+
+    `precursors` (a `PreSageFilteredPrecursors`-shaped mmappet dataset) supplies
+    both the RT-fit signal (joined onto confident-hit fragments via `psm_id`
+    through `sage_results_tsv`'s own `rt` column) and, for the apply pass, the
+    full-library `rt`/`fragment_spectrum_start`/`fragment_event_cnt` columns
+    `cut_and_index_precursors` already attaches to every precursor row --
+    broadcast onto every fragment row via `broadcast_precursor_values_to_fragments`,
+    no new indexing needed. Fragment rows whose precursor was filtered out of
+    `precursors` upstream (dead data, never read by the actual search) get the
+    global median precursor RT rather than an undefined value.
     """
     from mmappet.fs import copy_dataset
-    from timstofu.timstofmisc import apply_mz_recalibration
+    from timstofu.timstofmisc import apply_mz_recalibration_mz_rt, broadcast_precursor_values_to_fragments
 
-    from searchops.models import build_model
+    from searchops.models import PSplineModel, build_model
 
     df = filter_top_psms(sage_results_tsv, fdr)
     fragments = _confident_matched_fragments(matched_fragments, pd.Series(df["psm_id"]))
     fragment_mz = fragments["fragment_mz_experimental"].to_numpy()
     fragment_ppm = fragments["fragment_ppm"].to_numpy()
 
-    model = build_model(config["fragment_model"]).fit(fragment_mz, fragment_ppm)
+    mz_model = build_model(config["fragment_model"]).fit(fragment_mz, fragment_ppm)
+    mz_residual = fragment_ppm - mz_model.predict(fragment_mz)
+
+    rt_by_psm = df.set_index("psm_id")["rt"]
+    fragment_rt = fragments["psm_id"].map(rt_by_psm).to_numpy(dtype=np.float64)
+    fit_rt_lo, fit_rt_hi = float(fragment_rt.min()), float(fragment_rt.max())
+    rt_bin_width = max((fit_rt_hi - fit_rt_lo) / _FRAGMENT_RT_N_BINS, 1e-6)
+    rt_model = PSplineModel(bin_width_da=rt_bin_width, lam1=100.0, lam2=100.0).fit(fragment_rt, mz_residual)
 
     mz_pmsms = Path(mz_pmsms)
     output_pmsms = Path(output_pmsms)
@@ -371,14 +398,37 @@ def recalibrate_pmsms_mz(
 
     input_ds = mmappet.open_dataset_dct(mz_pmsms)
     raw_mz = input_ds["mz"]
+    n_fragments = len(raw_mz)
 
     n_grid = config.get("numba_grid_points", 2000)
     mz_lo = min(float(fragment_mz.min()), float(np.min(raw_mz)))
     mz_hi = max(float(fragment_mz.max()), float(np.max(raw_mz)))
-    breakpoints = np.linspace(mz_lo, mz_hi, n_grid)
-    grid_dim = EvenlySpacedLinearSpline(mz_lo, mz_hi, model.predict(breakpoints))
-    MzRecalibration(dims={"mz": grid_dim}).dump(mz_recalibration_path)
-    corrector = grid_dim.njit_evaluator()
+    mz_breakpoints = np.linspace(mz_lo, mz_hi, n_grid)
+    grid_mz = EvenlySpacedLinearSpline(mz_lo, mz_hi, mz_model.predict(mz_breakpoints))
+
+    precursors_ds = mmappet.open_dataset_dct(Path(precursors))
+    # `precursors_ds["rt"]` is raw Bruker frame time (seconds, from
+    # `timstofu.candidate_postprocessing.annotate`'s `frame2rt` lookup);
+    # `sage_results_tsv`'s own `rt` column (what `rt_model` was fit on, via
+    # `fragment_rt` above) is minutes -- convert here so both sides of the
+    # fit/apply split share one unit.
+    precursor_rt = np.asarray(precursors_ds["rt"], dtype=np.float64) / 60.0
+    precursor_rt = precursor_rt.astype(np.float32)
+    all_rt_lo, all_rt_hi = float(np.min(precursor_rt)), float(np.max(precursor_rt))
+    rt_breakpoints = np.linspace(all_rt_lo, all_rt_hi, n_grid)
+    grid_rt = EvenlySpacedLinearSpline(all_rt_lo, all_rt_hi, rt_model.predict(rt_breakpoints))
+
+    MzRecalibration(dims={"mz": grid_mz, "rt": grid_rt}).dump(mz_recalibration_path)
+    corrector_mz = grid_mz.njit_evaluator()
+    corrector_rt = grid_rt.njit_evaluator()
+
+    rt_per_fragment = np.full(n_fragments, float(np.median(precursor_rt)), dtype=np.float32)
+    broadcast_precursor_values_to_fragments(
+        precursors_ds["fragment_spectrum_start"],
+        precursors_ds["fragment_event_cnt"],
+        precursor_rt,
+        rt_per_fragment,
+    )
 
     fell_back = copy_dataset(mz_pmsms, output_pmsms, skip={f"{mz_idx}.bin"})
     if fell_back:
@@ -391,12 +441,14 @@ def recalibrate_pmsms_mz(
     with open(mz_path, "xb") as f:
         f.truncate(len(raw_mz) * raw_mz.dtype.itemsize)
     output_ds = mmappet.open_dataset_dct(output_pmsms, read_write=True)
-    with ProgressBar(total=len(raw_mz), desc="recalibrate_pmsms_mz: applying correction") as progress:
-        apply_mz_recalibration(raw_mz, corrector, 0.0, output_ds["mz"], progress)
+    with ProgressBar(total=n_fragments, desc="recalibrate_pmsms_mz: applying correction") as progress:
+        apply_mz_recalibration_mz_rt(
+            raw_mz, rt_per_fragment, corrector_mz, corrector_rt, 0.0, output_ds["mz"], progress
+        )
 
-    model.plot_fit(plot_path, fragment_mz, fragment_ppm, title="Fragment m/z recalibration fit")
+    mz_model.plot_fit(plot_path, fragment_mz, fragment_ppm, title="Fragment m/z recalibration fit")
 
-    residual = fragment_ppm - model.predict(fragment_mz)
+    residual = fragment_ppm - (mz_model.predict(fragment_mz) + rt_model.predict(fragment_rt))
     return _select_tolerance(residual, config["mz"])
 
 

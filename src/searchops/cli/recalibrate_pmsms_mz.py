@@ -18,6 +18,11 @@ def main() -> None:
     parser.add_argument("sage_results_tsv", type=Path, help="results.sage.tsv from the calibration pass")
     parser.add_argument("matched_fragments", type=Path, help="matched_fragments.sage.tsv from the calibration pass")
     parser.add_argument("mz_pmsms", type=Path, help="Input MzPmsms pmsms.mmappet dataset")
+    parser.add_argument(
+        "precursors", type=Path,
+        help="PreSageFilteredPrecursors mmappet dataset (rt/fragment_spectrum_start/"
+        "fragment_event_cnt source for the fragment RT-bias term)",
+    )
     parser.add_argument("output_pmsms", type=Path, help="Output recalibrated pmsms.mmappet dataset")
     parser.add_argument("mz_recalibration", type=Path, help="Output MzRecalibration grid artifact path (.mzcalib)")
     parser.add_argument("tolerance", type=Path, help="Output fragment tolerance JSON path")
@@ -30,7 +35,7 @@ def main() -> None:
         config = tomllib.load(handle)
 
     tolerance = recalibrate_pmsms_mz(
-        args.sage_results_tsv, args.matched_fragments, args.mz_pmsms,
+        args.sage_results_tsv, args.matched_fragments, args.mz_pmsms, args.precursors,
         config, args.fdr,
         output_pmsms=args.output_pmsms,
         mz_recalibration_path=args.mz_recalibration,
