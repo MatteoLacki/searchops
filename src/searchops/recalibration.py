@@ -141,6 +141,20 @@ def _fit_pspline(
     return spline, lo, hi
 
 
+def _resolve_per_dim(value: float | dict[str, float], dims: list[str], name: str) -> dict[str, float]:
+    """`value` is either one scalar shared by every dim, or a `{dim: value}`
+    dict giving each dim its own -- needed once dims stop sharing a natural
+    scale (e.g. fragment m/z in Da vs. RT in minutes), where one shared
+    `bin_width_da` can't be sane for both at once.
+    """
+    if isinstance(value, dict):
+        missing = [d for d in dims if d not in value]
+        if missing:
+            raise ValueError(f"{name} dict is missing entries for dims {missing!r}")
+        return {d: value[d] for d in dims}
+    return {d: value for d in dims}
+
+
 def fit_additive_correction(
     df: pd.DataFrame,
     dims: list[str],
@@ -166,10 +180,13 @@ def fit_additive_correction(
     `config["model"]` (only `"pspline_additive"` is implemented):
 
     `"pspline_additive"`: classical Gauss-Seidel backfitting using `_fit_pspline` as
-    the per-dimension smoother, `config.get("backfit_iters", 15)` passes over `dims`,
-    one shared `bin_width_da`/`lam1`/`lam2`/`degree` across all dimensions (no
-    per-dim hyperparameters yet). `intercept` is fixed up front as the weighted mean
-    of `target`; each round, each dimension refits against the partial residual
+    the per-dimension smoother, `config.get("backfit_iters", 15)` passes over `dims`.
+    `bin_width_da`/`lam1`/`lam2`/`degree` each accept either one scalar (shared by
+    every dim, the original behavior) or a `{dim: value}` dict giving each dim its
+    own -- required once dims stop sharing a natural scale (e.g. fragment m/z in Da
+    vs. RT in minutes: one `bin_width_da` can't bin both sanely). `intercept` is
+    fixed up front as the weighted mean of `target`; each round, each dimension
+    refits against the partial residual
     (`target` minus intercept minus every *other* dimension's current fit) and
     re-centers to weighted-mean zero -- additive models are identifiable only up to
     constants that shift between components while cancelling in the sum, so without
@@ -188,10 +205,10 @@ def fit_additive_correction(
     weight = np.ones_like(y) if weights is None else np.asarray(weights, dtype=np.float64)
 
     if model == "pspline_additive":
-        bin_width_da = config["bin_width_da"]
-        lam1 = config.get("lam1", 0.0)
-        lam2 = config.get("lam2", 0.0)
-        degree = config.get("degree", 3)
+        bin_width_da = _resolve_per_dim(config["bin_width_da"], dims, "bin_width_da")
+        lam1 = _resolve_per_dim(config.get("lam1", 0.0), dims, "lam1")
+        lam2 = _resolve_per_dim(config.get("lam2", 0.0), dims, "lam2")
+        degree = _resolve_per_dim(config.get("degree", 3), dims, "degree")
         n_iters = config.get("backfit_iters", 15)
         if n_iters < 1:
             raise ValueError(f"backfit_iters must be >= 1, got {n_iters!r}")
@@ -209,7 +226,8 @@ def fit_additive_correction(
                         others_sum += fitted_values[other]
                 partial_residual = y - intercept - others_sum
                 spline, lo, hi = _fit_pspline(
-                    columns[d], partial_residual, weight, bin_width_da, lam1, lam2, degree
+                    columns[d], partial_residual, weight,
+                    bin_width_da[d], lam1[d], lam2[d], int(degree[d]),
                 )
                 raw_values = spline(np.clip(columns[d], lo, hi))
                 mean_d = float(np.average(raw_values, weights=weight))
