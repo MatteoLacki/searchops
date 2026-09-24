@@ -142,6 +142,34 @@ was mass-migrated off `[0, 100]` — only `jobs/f9477_mokapot_full.toml` (a new
 job) uses a sane `[1, 99]`; existing `[0, 100]` jobs will now fail fast with a
 clear message instead of a cryptic one, which is itself the improvement.
 
+## `recalibration.py` — most-intense vs. closest fragment peak (2026-09-23)
+
+`git/sage` added, then replaced, a per-fragment ppm-error export; it settled on
+exporting raw peak coordinates instead: `matched_fragments.sage.tsv`/`.parquet` now
+carry `closest_fragment_mz_calculated`/`closest_fragment_mz_experimental` alongside
+the pre-existing `fragment_mz_calculated`/`fragment_mz_experimental` (which is always
+the *most-intense* peak in the tolerance window — unchanged). The two pairs coincide
+when the most-intense peak and the closest-by-mass peak are the same peak (the common
+case); they diverge when a weaker-but-nearer peak sat in the same window. See
+`git/sage`'s `docs/ai/matched_fragment_closest_peak.md` for why (sign convention,
+tie-breaks, the charge-hypothesis interaction) — this repo just consumes the columns.
+
+`_confident_matched_fragments` no longer computes `fragment_ppm` itself; it now only
+filters to confident PSM ids, and two callers derive `fragment_ppm` from different
+peak choices via `_symmetric_ppm`:
+- `_unambiguous_fragment_ppm` — drops every fragment where most-intense != closest,
+  then computes ppm from the (now-agreeing) `fragment_mz_*` pair. Used by
+  `recalibrate_pmsms_mz` to fit the recalibration spline: a coincidentally-close but
+  physically different peak (see `matched_fragment_closest_peak.md`'s
+  charge-resolution note — this does happen on real data, confirmed 2026-09-23)
+  contaminating the fit would bias it, so ambiguous rows are excluded rather than
+  corrected some other way.
+- `_closest_fragment_ppm` — every confident fragment, ppm computed from the
+  `closest_fragment_mz_*` pair, no filtering. Used by `plot_recalibrated_ppm` (both
+  the initial and final panels, for a fair before/after comparison) since the
+  reported ppm distribution should reflect true mass accuracy, not which peak
+  happened to be most intense.
+
 ## Adding a new CLI tool
 
 1. Add `src/searchops/cli/<name>.py` with a `main()` entry point.

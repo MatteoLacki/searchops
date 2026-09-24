@@ -59,17 +59,47 @@ def _symmetric_ppm(experimental: np.ndarray, calculated: np.ndarray) -> np.ndarr
 def _confident_matched_fragments(
     matched_fragments: str | Path, confident_psm_ids: pd.Series,
 ) -> pd.DataFrame:
-    """Matched fragments belonging to confident PSMs, with a signed `fragment_ppm`
-    column added. Sage's per-PSM `fragment_ppm` (in `results.sage.tsv`) is an
-    intensity-weighted mean of *absolute* error and can't be used as a residual --
-    `matched_fragments.sage.tsv`'s per-fragment `fragment_mz_calculated`/
-    `fragment_mz_experimental` gives a genuine signed value instead.
+    """Matched fragments belonging to confident PSMs -- unfiltered, no derived
+    columns. Sage's per-PSM `fragment_ppm` (in `results.sage.tsv`) is an
+    intensity-weighted mean of *absolute* error and can't be used as a residual;
+    `matched_fragments.sage.tsv`'s per-fragment columns give a genuine signed
+    value instead. Which peak (Sage's most-intense match, or the closest-by-mass
+    peak in the same window -- not always the same peak) to compute that from
+    is the caller's choice: see `_unambiguous_fragment_ppm`/`_closest_fragment_ppm`.
     """
     fragments = read_df(matched_fragments)
-    fragments = fragments[fragments["psm_id"].isin(confident_psm_ids)].copy()
+    return fragments[fragments["psm_id"].isin(confident_psm_ids)].copy()
+
+
+def _unambiguous_fragment_ppm(fragments: pd.DataFrame) -> pd.DataFrame:
+    """Fragments where Sage's most-intense match and the closest-by-mass peak
+    are the *same* peak, with a signed `fragment_ppm` column added -- for
+    fitting the recalibration model, where a coincidentally-close but
+    different (and possibly wrong-charge, see `git/sage`'s
+    `docs/ai/matched_fragment_ppm_errors.md`) peak contaminating the fit
+    would bias it. Ambiguous fragments (most-intense != closest) are dropped
+    entirely, not corrected some other way.
+    """
+    unambiguous = fragments[
+        fragments["fragment_mz_experimental"] == fragments["closest_fragment_mz_experimental"]
+    ].copy()
+    unambiguous["fragment_ppm"] = _symmetric_ppm(
+        unambiguous["fragment_mz_experimental"].to_numpy(),
+        unambiguous["fragment_mz_calculated"].to_numpy(),
+    )
+    return unambiguous
+
+
+def _closest_fragment_ppm(fragments: pd.DataFrame) -> pd.DataFrame:
+    """Every fragment's signed ppm error against the closest-by-mass peak
+    (not necessarily the one Sage actually matched), added as `fragment_ppm`
+    -- for the final reported ppm distribution, which should reflect true
+    mass accuracy rather than which peak happened to be most intense.
+    """
+    fragments = fragments.copy()
     fragments["fragment_ppm"] = _symmetric_ppm(
-        fragments["fragment_mz_experimental"].to_numpy(),
-        fragments["fragment_mz_calculated"].to_numpy(),
+        fragments["closest_fragment_mz_experimental"].to_numpy(),
+        fragments["closest_fragment_mz_calculated"].to_numpy(),
     )
     return fragments
 
@@ -363,16 +393,18 @@ def recalibrate_pmsms_mz(
     through `sage_results_tsv`'s own `rt` column) and, for the apply pass, the
     full-library `rt`/`fragment_spectrum_start`/`fragment_event_cnt` columns
     `cut_and_index_precursors` already attaches to every precursor row --
-    broadcast onto every fragment row via `broadcast_precursor_values_to_fragments`,
+    applied per block of fragment rows via `timstofu`'s `precursor_rt_blocks`,
     no new indexing needed. Fragment rows whose precursor was filtered out of
     `precursors` upstream (dead data, never read by the actual search) get the
     global median precursor RT rather than an undefined value.
     """
     from mmappet.fs import copy_dataset
-    from timstofu.timstofmisc import apply_mz_recalibration_mz_rt, broadcast_precursor_values_to_fragments
+    from timstofu.timstofmisc import apply_mz_recalibration_mz_rt_blocks, precursor_rt_blocks
 
     df = filter_top_psms(sage_results_tsv, fdr)
-    fragments = _confident_matched_fragments(matched_fragments, pd.Series(df["psm_id"]))
+    fragments = _unambiguous_fragment_ppm(
+        _confident_matched_fragments(matched_fragments, pd.Series(df["psm_id"]))
+    )
     fragment_mz = fragments["fragment_mz_experimental"].to_numpy()
     fragment_ppm = fragments["fragment_ppm"].to_numpy()
 
@@ -439,12 +471,15 @@ def recalibrate_pmsms_mz(
     corrector_mz = grid_mz.njit_evaluator()
     corrector_rt = grid_rt.njit_evaluator()
 
-    rt_per_fragment = np.full(n_fragments, float(np.median(precursor_rt)), dtype=np.float32)
-    broadcast_precursor_values_to_fragments(
+    # RT per block of fragment rows (one block per precursor, median RT for
+    # the gaps), not per fragment: a per-fragment array is 4 bytes x every
+    # peak -- 14 GB on F9468, 140 GB on B6699.
+    block_start, block_end, block_rt = precursor_rt_blocks(
         precursors_ds["fragment_spectrum_start"],
         precursors_ds["fragment_event_cnt"],
         precursor_rt,
-        rt_per_fragment,
+        np.float32(np.median(precursor_rt)),
+        n_fragments,
     )
 
     fell_back = copy_dataset(mz_pmsms, output_pmsms, skip={f"{mz_idx}.bin"})
@@ -459,8 +494,9 @@ def recalibrate_pmsms_mz(
         f.truncate(len(raw_mz) * raw_mz.dtype.itemsize)
     output_ds = mmappet.open_dataset_dct(output_pmsms, read_write=True)
     with ProgressBar(total=n_fragments, desc="recalibrate_pmsms_mz: applying correction") as progress:
-        apply_mz_recalibration_mz_rt(
-            raw_mz, rt_per_fragment, corrector_mz, corrector_rt, bias, output_ds["mz"], progress
+        apply_mz_recalibration_mz_rt_blocks(
+            raw_mz, block_start, block_end, block_rt,
+            corrector_mz, corrector_rt, bias, output_ds["mz"], progress,
         )
 
     _plot_fragment_mz_fit(plot_path, fragment_mz, fragment_ppm, bias, mz_component)
@@ -554,11 +590,11 @@ def plot_recalibrated_ppm(
     initial_precursor_ppm = initial_df["precursor_ppm"].to_numpy()
     final_precursor_ppm = final_df["precursor_ppm"].to_numpy()
 
-    initial_fragment_ppm = _confident_matched_fragments(
-        initial_matched_fragments, pd.Series(initial_df["psm_id"])
+    initial_fragment_ppm = _closest_fragment_ppm(
+        _confident_matched_fragments(initial_matched_fragments, pd.Series(initial_df["psm_id"]))
     )["fragment_ppm"].to_numpy()
-    final_fragment_ppm = _confident_matched_fragments(
-        matched_fragments, pd.Series(final_df["psm_id"])
+    final_fragment_ppm = _closest_fragment_ppm(
+        _confident_matched_fragments(matched_fragments, pd.Series(final_df["psm_id"]))
     )["fragment_ppm"].to_numpy()
 
     precursor_lo, precursor_hi = precursor_tolerance["ppm"]
