@@ -170,20 +170,25 @@ peak choices via `_symmetric_ppm`:
   reported ppm distribution should reflect true mass accuracy, not which peak
   happened to be most intense.
 
-## `recalibrate_pmsms_mz` writes `fragment_shift_ppm`, not a pmsms (2026-10)
+## `recalibrate_pmsms_mz` writes a recalibrated tof2mz table and `fragment_shift_ppm` (2026-10)
 
-SAGE now applies the fragment correction while reading peaks (necromerge2
-`plans/fragment_mz_correction_in_sage.md`; git/sage `docs/ai/pmsms_input.md`). The
-fit is unchanged (`bias + f_mz(mz) + f_rt(rt)`, backfitted); its outputs are:
+SAGE now reads fragment m/z as `tof2mz[tof]` and applies the correction itself
+(necromerge2 `plans/fragment_mz_corrected_tof2mz_table.md`; git/sage
+`docs/ai/pmsms_input.md`). The fit is unchanged (`bias + f_mz(mz) + f_rt(rt)`,
+backfitted); its outputs are:
 
-- an `.mzcalib` with only the `mz` curve and `bias = 0`;
+- a recalibrated tof2mz table, `table[t] / (1 + f_mz(table[t]) * 1e-6)`, with
+  `f_mz` evaluated exactly at every entry (no grid). It is float64: a float32
+  table would round every m/z twice and, measured on F9477, move 25% of peaks by
+  one float32 ulp;
 - the input precursors plus `fragment_shift_ppm = bias + f_rt(rt / 60)`, evaluated
-  exactly (no grid) from the raw `rt` column, so later RT correction can't move it;
+  exactly from the raw `rt` column, so later RT correction can't move it;
 - tolerance and plot, as before.
 
-It reads no `mz` column: the `f_mz` grid range comes from `tof2mz_table[tof]` over
-the pmsms' `tof` column (`_pmsms_mz_range`, `table[min tof] .. table[max tof]`; the
-table must increase with tof). Tests: `tests/test_recalibrate_pmsms_mz.py`.
+It reads no pmsms at all. An earlier version of this (same month) wrote an
+`mz`-only `.mzcalib` that SAGE evaluated per peak, which needed a bit-exact Rust
+copy of the spline; folding `f_mz` into the table removed that. Tests:
+`tests/test_recalibrate_pmsms_mz.py`.
 
 ## Adding a new CLI tool
 

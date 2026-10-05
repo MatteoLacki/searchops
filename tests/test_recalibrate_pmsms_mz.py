@@ -6,7 +6,6 @@ import pandas as pd
 import pytest
 
 from searchops.recalibration import recalibrate_pmsms_mz
-from timstofu.mzrecalibration import MzRecalibration
 
 
 def _true_ppm(mz: np.ndarray, rt_minutes: np.ndarray) -> np.ndarray:
@@ -41,12 +40,6 @@ def inputs(tmp_path: Path) -> dict:
         "closest_fragment_mz_experimental": experimental,
     }).to_csv(tmp_path / "matched_fragments.sage.tsv", sep="\t", index=False)
 
-    # The pmsms' m/z spans 300 .. 1500 Da: tofs 10 .. 90 over the table 150 + 15 * tof.
-    with mmappet.DatasetWriter(tmp_path / "pmsms.mmappet") as writer:
-        writer.append_df(pd.DataFrame({
-            "tof": np.array([50, 10, 90, 30], dtype=np.uint32),
-            "intensity": np.ones(4, dtype=np.uint32),
-        }))
     with mmappet.DatasetWriter(tmp_path / "tof2mz.mmappet") as writer:
         writer.append_df(pd.DataFrame({"mz": (150.0 + 15.0 * np.arange(100)).astype(np.float32)}))
 
@@ -73,45 +66,44 @@ def _run(dir: Path) -> dict:
     return recalibrate_pmsms_mz(
         dir / "results.sage.tsv",
         dir / "matched_fragments.sage.tsv",
-        dir / "pmsms.mmappet",
         dir / "tof2mz.mmappet",
         dir / "precursors.mmappet",
         config,
         fdr=0.01,
         output_precursors=dir / "shifted_precursors.mmappet",
-        mz_recalibration_path=dir / "fragment.mzcalib",
+        output_tof2mz_table=dir / "recalibrated_tof2mz.mmappet",
         plot_path=dir / "fit.png",
     )
 
 
-def test_writes_mz_only_calibration_and_per_precursor_shift(inputs: dict) -> None:
+def test_writes_recalibrated_table_and_per_precursor_shift(inputs: dict) -> None:
     dir = inputs["dir"]
     tolerance = _run(dir)
 
-    recalibration = MzRecalibration.load(dir / "fragment.mzcalib")
-    assert set(recalibration.dims) == {"mz"}
-    assert recalibration.bias == 0.0
-    f_mz = recalibration.dims["mz"]
-    assert (f_mz.x_min, f_mz.x_max) == pytest.approx((300.0, 1500.0), abs=1.0)
+    table = np.asarray(mmappet.open_dataset_dct(dir / "tof2mz.mmappet")["mz"], dtype=np.float64)
+    recalibrated = mmappet.open_dataset_dct(dir / "recalibrated_tof2mz.mmappet")["mz"]
+    assert recalibrated.dtype == np.float64 and len(recalibrated) == len(table)
 
     shifted = mmappet.open_dataset(dir / "shifted_precursors.mmappet")
     expected = inputs["precursors"]
     assert list(shifted.columns) == [*expected.columns, "fragment_shift_ppm"]
     pd.testing.assert_frame_equal(shifted[expected.columns], expected)
 
-    mz = np.array([400.0, 800.0, 1200.0])
+    tofs = np.array([20, 50, 70])  # 450, 900 and 1200 Da, inside the fitted 320-1480 Da
+    raw = table[tofs]
     for rt_seconds, shift_ppm in zip(expected["rt"], shifted["fragment_shift_ppm"]):
-        np.testing.assert_allclose(
-            f_mz.evaluate(mz) + shift_ppm, _true_ppm(mz, np.full(3, rt_seconds / 60.0)), atol=0.1
-        )
+        corrected = recalibrated[tofs] / (1.0 + shift_ppm * 1e-6)
+        total_ppm = (raw / corrected - 1.0) * 1e6
+        np.testing.assert_allclose(total_ppm, _true_ppm(raw, np.full(3, rt_seconds / 60.0)), atol=0.1)
 
     lo, hi = tolerance["ppm"]
     assert lo == pytest.approx(-hi, abs=0.05)
     assert 0.1 < hi < 0.5
 
 
-def test_refuses_to_overwrite_output_precursors(inputs: dict) -> None:
+@pytest.mark.parametrize("output", ["shifted_precursors.mmappet", "recalibrated_tof2mz.mmappet"])
+def test_refuses_to_overwrite_outputs(inputs: dict, output: str) -> None:
     dir = inputs["dir"]
-    (dir / "shifted_precursors.mmappet").mkdir()
+    (dir / output).mkdir()
     with pytest.raises(FileExistsError):
         _run(dir)

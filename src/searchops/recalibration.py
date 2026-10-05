@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Callable
 
 import mmappet
-import numba
 import numpy as np
 import pandas as pd
 from scipy.interpolate import BSpline
@@ -21,7 +20,6 @@ from scipy.sparse.linalg import spsolve
 from scipy.stats import norm
 
 from pandas_ops.io import read_df
-from timstofu.mzrecalibration import EvenlySpacedLinearSpline, MzRecalibration
 
 PROTON_MASS = 1.00727646688
 
@@ -358,29 +356,28 @@ def _plot_fragment_mz_fit(
 def recalibrate_pmsms_mz(
     sage_results_tsv: str | Path,
     matched_fragments: str | Path,
-    pmsms: str | Path,
     tof2mz_table: str | Path,
     precursors: str | Path,
     config: dict,
     fdr: float,
     output_precursors: str | Path,
-    mz_recalibration_path: str | Path,
+    output_tof2mz_table: str | Path,
     plot_path: str | Path,
 ) -> dict:
     """Fit `f_mz(fragment_mz) + f_rt(precursor_rt)` jointly on confident-PSM
     fragment residuals via `fit_additive_correction`'s `pspline_additive`
     (real Gauss-Seidel backfitting, not a one-pass sequential approximation),
-    and apply it the way SAGE's `--mz-recalibration` consumes it:
+    and apply it the way SAGE reads it:
 
-    - `f_mz` is grid-sampled into an `MzRecalibration` artifact with the single
-      dimension `mz` and `bias = 0`;
+    - `f_mz` depends only on m/z, which depends only on tof, so it is folded into
+      the tof2mz table: `output_tof2mz_table[t] = table[t] / (1 + f_mz(table[t]) * 1e-6)`,
+      float64 so that each m/z is rounded to float32 only once, by SAGE;
     - `bias + f_rt(rt)` is constant per precursor, so it is evaluated once per
       row of `precursors` (raw `rt`, seconds) and written to `output_precursors`
       as `fragment_shift_ppm`, every other column copied unchanged.
 
-    SAGE then divides each fragment m/z by
-    `1 + (f_mz(mz) + fragment_shift_ppm) * 1e-6`. Nothing here touches the
-    fragment rows themselves.
+    SAGE then reads each fragment m/z as
+    `output_tof2mz_table[tof] / (1 + fragment_shift_ppm * 1e-6)`.
 
     `config["fragment_model"]` must be `searchops.models.PSplineModel`-shaped
     (`kwargs: {bin_width_da, lam1?, lam2?, degree?}`) -- backfitting jointly
@@ -388,10 +385,6 @@ def recalibrate_pmsms_mz(
     dim reuses `config["fragment_model"]["kwargs"]` verbatim; the rt dim gets its
     own `bin_width_da` (`(fit_rt_hi - fit_rt_lo) / _FRAGMENT_RT_N_BINS`, since
     RT's ~0-8 minute range needs a far finer bin width than mz's Da-scale one).
-
-    The `f_mz` grid spans the fitted fragments and every fragment of `pmsms`:
-    `tof2mz_table[tof]` over its `tof` column, i.e. `table[min tof]` to
-    `table[max tof]` since the table increases with tof.
     """
     df = filter_top_psms(sage_results_tsv, fdr)
     fragments = _unambiguous_fragment_ppm(
@@ -430,16 +423,14 @@ def recalibrate_pmsms_mz(
     rt_component = components["rt"]
 
     output_precursors = Path(output_precursors)
-    if output_precursors.exists():
-        raise FileExistsError(f"{output_precursors} already exists")
+    output_tof2mz_table = Path(output_tof2mz_table)
+    for output in (output_precursors, output_tof2mz_table):
+        if output.exists():
+            raise FileExistsError(f"{output} already exists")
 
-    pmsms_mz_lo, pmsms_mz_hi = _pmsms_mz_range(Path(pmsms), Path(tof2mz_table))
-    n_grid = config.get("numba_grid_points", 2000)
-    mz_lo = min(float(fragment_mz.min()), pmsms_mz_lo)
-    mz_hi = max(float(fragment_mz.max()), pmsms_mz_hi)
-    mz_breakpoints = np.linspace(mz_lo, mz_hi, n_grid)
-    grid_mz = EvenlySpacedLinearSpline(mz_lo, mz_hi, mz_component(mz_breakpoints))
-    MzRecalibration(dims={"mz": grid_mz}, bias=0.0).dump(mz_recalibration_path)
+    table = np.asarray(mmappet.open_dataset_dct(Path(tof2mz_table))["mz"], dtype=np.float64)
+    with mmappet.DatasetWriter(output_tof2mz_table) as writer:
+        writer.append_df(pd.DataFrame({"mz": table / (1.0 + mz_component(table) * 1e-6)}))
 
     # `precursors`' `rt` is raw Bruker frame time in seconds; `sage_results_tsv`'s
     # `rt` (what `rt_component` was fit on) is minutes.
@@ -453,28 +444,6 @@ def recalibrate_pmsms_mz(
 
     residual = fragment_ppm - (bias + mz_component(fragment_mz) + rt_component(fragment_rt))
     return _select_tolerance(residual, config["mz"])
-
-
-def _pmsms_mz_range(pmsms: Path, tof2mz_table: Path) -> tuple[float, float]:
-    """`(min, max)` of `tof2mz_table[tof]` over `pmsms`' `tof` column."""
-    tof = mmappet.open_dataset_dct(pmsms)["tof"]
-    table = np.asarray(mmappet.open_dataset_dct(tof2mz_table)["mz"])
-    tof_lo, tof_hi = _min_max(tof)
-    if np.any(np.diff(table[tof_lo : tof_hi + 1]) < 0):
-        raise ValueError(f"{tof2mz_table} decreases between tof {tof_lo} and {tof_hi}")
-    return float(table[tof_lo]), float(table[tof_hi])
-
-
-@numba.njit(nogil=True)
-def _min_max(values: np.ndarray) -> tuple[int, int]:
-    lo = values[0]
-    hi = values[0]
-    for v in values:
-        if v < lo:
-            lo = v
-        elif v > hi:
-            hi = v
-    return lo, hi
 
 
 def recalibrate_precursors(
