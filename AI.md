@@ -57,6 +57,12 @@ Maps SAGE FDR-filtered PSMs and matched fragments to entries in a pmsms mmappet 
 - `mapping.parquet` — one row per matched fragment (`pmsms_fragment_idx`, `sage_fragment_idx`)
 - `mz_delta_quantiles.parquet` — 101-point quantile distribution of m/z errors
 
+**Fragment m/z** (2026-10): with `--tof2mz <table>`, read from the pmsms' `tof`
+column as `float32(table[tof] / (1 + fragment_shift_ppm*1e-6))`, the shift from the
+precursors table when it has the column — SAGE's own arithmetic, so the m/z match what
+SAGE searched; without it, the `mz` column (necromerge2
+`plans/exports_from_tof2mz_table.md`). `_fragment_mz_source` / `_fragment_mz`.
+
 **Matching algorithm**: Numba-compiled two-pointer O(n+m) scan per precursor group.
 Experimental m/z values are sorted; library m/z is pre-sorted. Ties resolve to the
 lower-m/z library entry (pointer is **not** advanced on equality).

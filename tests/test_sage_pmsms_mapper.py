@@ -98,3 +98,40 @@ def test_missing_mz_fails(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="need an 'mz' column"):
         _run_mapper(paths, tmp_path / "out")
+
+
+def test_tof2mz_table_with_fragment_shift_maps_like_the_mz_column(tmp_path: Path) -> None:
+    paths = _write_mapper_inputs(tmp_path, include_mz=False)
+    shift_ppm = np.array([1.5, -2.25])
+    precursors = pd.read_parquet(paths["precursors"]).assign(fragment_shift_ppm=shift_ppm)
+    precursors.to_parquet(paths["precursors"], index=False)
+
+    # Precursor 10 owns tofs 0, 2, 4 and precursor 20 tofs 1, 3, 5: undo each shift
+    # in the table so that table[tof] / (1 + shift*1e-6) lands on FRAG_MZ.
+    owner_shift = np.repeat(shift_ppm, 3)
+    table = np.zeros(6)
+    table[FRAG_TOF] = FRAG_MZ.astype(np.float64) * (1.0 + owner_shift * 1e-6)
+    _write_mmappet(tmp_path / "tof2mz.mmappet", {"mz": table})
+    expected_mz = (table[FRAG_TOF] / (1.0 + owner_shift * 1e-6)).astype(np.float32)
+    pd.DataFrame(
+        {
+            "psm_id": ["psm_a", "psm_a", "psm_b", "psm_b"],
+            "fragment_mz_experimental": expected_mz[[0, 2, 3, 5]],
+        }
+    ).to_parquet(paths["matched"], index=False)
+
+    out = tmp_path / "out"
+    map_sage_to_pmsms(
+        filtered_parquet=paths["filtered"],
+        matched_fragments=paths["matched"],
+        precursors_parquet=paths["precursors"],
+        pmsms_dir=paths["pmsms"],
+        output=out,
+        verbose=False,
+        tof2mz=tmp_path / "tof2mz.mmappet",
+    )
+
+    mapping = pd.read_parquet(out / "mapping.parquet")
+    assert mapping["pmsms_fragment_idx"].tolist() == [0, 2, 3, 5]
+    assert mapping["sage_fragment_idx"].tolist() == [0, 1, 2, 3]
+    assert (pd.read_parquet(out / "mz_delta_quantiles.parquet")["mz_delta"] == 0).all()

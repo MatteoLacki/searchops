@@ -4,7 +4,8 @@ Mapping chain:
   scannr 'precursor_idx=N charge=C ...'
     → precursors_parquet[precursor_idx]
     → fragment_spectrum_start, fragment_event_cnt
-    → pmsms_mz[start : start+cnt]
+    → fragment m/z [start : start+cnt], read as SAGE read them: tof2mz[tof] /
+      (1 + fragment_shift_ppm*1e-6) with --tof2mz, else the pmsms' mz column
     → binary-search nearest-neighbour match on fragment_mz_experimental
     → pmsms_fragment_idx per sage matched fragment
 
@@ -98,12 +99,23 @@ def _sort_exp_mz_groups(exp_mz_arr, psm_idx):
             chunk.sort()
 
 
+@numba.njit(inline="always")
+def _fragment_mz(i, divisor, source):
+    """Fragment `i`'s m/z: the pmsms' `mz` column, or `float32(tof2mz[tof[i]] / divisor)`,
+    SAGE's arithmetic, when `source` reads a table (see `_fragment_mz_source`)."""
+    mz_column, tof, tof2mz, reads_table = source
+    if reads_table:
+        return np.float32(tof2mz[tof[i]] / divisor)
+    return mz_column[i]
+
+
 @numba.njit(parallel=True, boundscheck=True)
 def _match_fragments_numba(
     frag_start,  # int64[N_groups] — fragment_spectrum_start per PSM group
     frag_cnt,  # int64[N_groups] — fragment_event_cnt per PSM group
+    divisors,  # float64[N_groups] — 1 + fragment_shift_ppm*1e-6 per PSM group
     psm_idx,  # int64[N_groups + 1] — CSR over exp_mz_arr: PSM k spans [psm_idx[k], psm_idx[k+1])
-    pmsms_mz,  # float32[N_frags]   — sorted within each precursor slice
+    source,  # `_fragment_mz_source` — library m/z, sorted within each precursor slice
     exp_mz_arr,  # float32[N_rows]    — experimental fragment m/z, sorted within each PSM group
     out_idx,  # int64[N_rows]      — output: absolute pmsms fragment index
     progress=None,
@@ -113,15 +125,15 @@ def _match_fragments_numba(
 
     Layout:
       - PSM group i covers exp_mz_arr[psm_idx[i] : psm_idx[i+1]] (sorted ascending).
-      - The corresponding library slice is pmsms_mz[frag_start[i] : frag_start[i]+frag_cnt[i]]
-        (also sorted ascending within each precursor, as written by the pipeline).
+      - The corresponding library slice is fragments frag_start[i] : frag_start[i]+frag_cnt[i]
+        (m/z sorted ascending within each precursor, as written by the pipeline).
 
     Algorithm: O(n+m) two-pointer scan.  Pointer p advances monotonically through
     the library slice; for each query m/z we move p forward as long as the next
     library entry is strictly closer.  Ties go to the lower-m/z library entry
     (p is not advanced when distances are equal).
 
-    Output: out_idx[j] = absolute index into pmsms_mz of the nearest library
+    Output: out_idx[j] = absolute pmsms fragment index of the nearest library
     fragment for experimental fragment j.
     """
     for i in numba.prange(len(frag_start)):
@@ -129,6 +141,7 @@ def _match_fragments_numba(
         ge = psm_idx[i + 1]
         start = frag_start[i]
         cnt = frag_cnt[i]
+        divisor = divisors[i]
         if cnt == np.int64(0):
             if progress is not None:
                 progress.update(1)
@@ -140,19 +153,27 @@ def _match_fragments_numba(
         for j in range(gs, ge):
             q = exp_mz_arr[j]
             while p + np.int64(1) < cnt and abs(
-                pmsms_mz[start + p + np.int64(1)] - q
-            ) < abs(pmsms_mz[start + p] - q):
+                _fragment_mz(start + p + np.int64(1), divisor, source) - q
+            ) < abs(_fragment_mz(start + p, divisor, source) - q):
                 p += np.int64(1)
             out_idx[j] = start + p
         if progress is not None:
             progress.update(1)
 
 
-def _load_fragment_mz(pmsms_dir: Path) -> np.ndarray:
+def _fragment_mz_source(pmsms_dir: Path, tof2mz: Path | None) -> tuple:
+    """`(mz_column, tof, tof2mz_table, reads_table)` for `_fragment_mz`: the pmsms'
+    `tof` column with a (float32 raw or float64 recalibrated) tof2mz table when
+    `tof2mz` is given, else its `mz` column. Unused members are empty arrays."""
     fragments = mmappet.open_dataset_dct(pmsms_dir)
-    if "mz" not in fragments:
-        raise ValueError("pmsms fragments need an 'mz' column")
-    return fragments["mz"]
+    if tof2mz is None:
+        if "mz" not in fragments:
+            raise ValueError("pmsms fragments need an 'mz' column (or pass a tof2mz table)")
+        return fragments["mz"], np.empty(0, np.uint32), np.empty(0, np.float64), False
+    if "tof" not in fragments:
+        raise ValueError("pmsms fragments need a 'tof' column to read m/z through a tof2mz table")
+    table = np.asarray(mmappet.open_dataset_dct(Path(tof2mz))["mz"], dtype=np.float64)
+    return np.empty(0, np.float32), fragments["tof"], table, True
 
 
 if __name__ == "__main__":
@@ -187,17 +208,20 @@ def map_sage_to_pmsms(
     mz_err_tol: float = 0.001,
     verbose: bool = True,
     use_duckdb: bool = True,
+    tof2mz: Path | None = None,
 ) -> None:
     """Map sage FDR-filtered PSMs and matched fragments to pmsms.mmappet entries.
+
+    Fragment m/z are read as SAGE read them: with `tof2mz`, `tof2mz[tof]` divided by
+    each precursor's `1 + fragment_shift_ppm*1e-6` (when `precursors_parquet` has that
+    column); without it, the pmsms' `mz` column.
 
     Writes a directory containing three parquet files (see module docstring).
     """
     # ── 1. Load fragment m/z source ──────────────────────────────────────────
     if verbose:
         print("Loading pmsms fragment m/z source...")
-    pmsms_mz = _load_fragment_mz(pmsms_dir)
-    if verbose:
-        print(f"  {len(pmsms_mz):_} fragment peaks")
+    source = _fragment_mz_source(pmsms_dir, tof2mz)
 
     # ── 2. Load PSMs + matched fragments, resolve precursor slices ────────────
     if verbose:
@@ -205,6 +229,8 @@ def map_sage_to_pmsms(
 
     con = duckdb.connect()
     prec_df = read_df(precursors_parquet)
+    if "fragment_shift_ppm" not in prec_df.columns:
+        prec_df["fragment_shift_ppm"] = 0.0
     con.register("precursors_tbl", prec_df)
     con.register("matched_tbl", read_df(matched_fragments))
 
@@ -228,13 +254,14 @@ def map_sage_to_pmsms(
                 FROM read_parquet('{filtered_parquet}')
             ),
             prec AS (
-                SELECT precursor_idx, fragment_spectrum_start, fragment_event_cnt, charges
+                SELECT precursor_idx, fragment_spectrum_start, fragment_event_cnt, charges,
+                       fragment_shift_ppm
                 FROM precursors_tbl
                 WHERE fragment_event_cnt > 0
             )
             SELECT
                 m.precursor_idx, m.charge,
-                p.charges, p.fragment_spectrum_start, p.fragment_event_cnt,
+                p.charges, p.fragment_spectrum_start, p.fragment_event_cnt, p.fragment_shift_ppm,
                 r.fragment_mz_experimental, r.sage_fragment_idx
             FROM raw r
             JOIN psm_map m USING (psm_id)
@@ -268,7 +295,8 @@ def map_sage_to_pmsms(
         # precursor slice info (one row per precursor_idx)
         prec = con.sql(
             """
-            SELECT precursor_idx, fragment_spectrum_start, fragment_event_cnt, charges
+            SELECT precursor_idx, fragment_spectrum_start, fragment_event_cnt, charges,
+                   fragment_shift_ppm
             FROM precursors_tbl
             WHERE fragment_event_cnt > 0
             """
@@ -285,6 +313,7 @@ def map_sage_to_pmsms(
                     "charges",
                     "fragment_spectrum_start",
                     "fragment_event_cnt",
+                    "fragment_shift_ppm",
                     "fragment_mz_experimental",
                     "sage_fragment_idx",
                 ]
@@ -319,7 +348,8 @@ def map_sage_to_pmsms(
             first(charges)                  AS charges,
             count(*)                        AS cnt,
             first(fragment_spectrum_start)  AS fragment_spectrum_start,
-            first(fragment_event_cnt)       AS fragment_event_cnt
+            first(fragment_event_cnt)       AS fragment_event_cnt,
+            first(fragment_shift_ppm)       AS fragment_shift_ppm
         FROM merged
         GROUP BY precursor_idx
         ORDER BY precursor_idx
@@ -370,13 +400,15 @@ def map_sage_to_pmsms(
     # ── 3. Nearest-neighbour match per precursor (parallel Numba kernel) ──────
     # Output: one pmsms fragment index per matched-fragment row; -1 = unmatched.
     pmsms_fragment_idx = np.full(len(exp_mz_arr), -1, dtype=np.int64)
+    divisors = 1.0 + psm_counts["fragment_shift_ppm"].to_numpy(dtype=np.float64) * 1e-6
 
     with ProgressBar(total=len(psm_counts), desc="Matching precursors") as progress:
         _match_fragments_numba(
             frag_start=psm_counts.fragment_spectrum_start.to_numpy(),
             frag_cnt=psm_counts.fragment_event_cnt.to_numpy(),
+            divisors=divisors,
             psm_idx=psm_idx,
-            pmsms_mz=pmsms_mz,
+            source=source,
             exp_mz_arr=exp_mz_arr,
             out_idx=pmsms_fragment_idx,
             progress=progress,
@@ -391,7 +423,13 @@ def map_sage_to_pmsms(
 
     # ── 4. Apply mz tolerance filter ─────────────────────────────────────────
     matched_frag_idx = pmsms_fragment_idx[nn_matched]
-    mz_delta = pmsms_mz[matched_frag_idx] - exp_mz_arr[nn_matched]
+    row_divisors = np.repeat(divisors, psm_counts.cnt.to_numpy())[nn_matched]
+    mz_column, tof, table, reads_table = source
+    if reads_table:
+        library_mz = (table[tof[matched_frag_idx]] / row_divisors).astype(np.float32)
+    else:
+        library_mz = mz_column[matched_frag_idx]
+    mz_delta = library_mz - exp_mz_arr[nn_matched]
     within_tol = np.abs(mz_delta) <= mz_err_tol
 
     if verbose:
@@ -497,6 +535,13 @@ def main():
         default=0.001,
         help="Maximum absolute m/z error to retain a match (default: 0.001)",
     )
+    parser.add_argument(
+        "--tof2mz",
+        type=Path,
+        default=None,
+        help="tof -> m/z table (float32 or float64 column mz): read fragment m/z as "
+        "tof2mz[tof] / (1 + fragment_shift_ppm*1e-6), as SAGE does, instead of the pmsms' mz column",
+    )
     args = parser.parse_args()
 
     map_sage_to_pmsms(
@@ -506,6 +551,7 @@ def main():
         pmsms_dir=args.pmsms_dir,
         output=args.output,
         mz_err_tol=args.mz_err_tol,
+        tof2mz=args.tof2mz,
     )
 
 
