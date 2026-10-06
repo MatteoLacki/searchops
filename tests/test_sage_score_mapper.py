@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 from searchops.cli import sage_score_mapper as mod
 
@@ -63,3 +64,21 @@ def test_q30_threshold_works_after_filtering():
     threshold = float(np.quantile(log10_int_matched[finite_q30_matched], 0.30))
     assert np.isfinite(threshold)
     assert threshold >= 1.0
+
+
+def test_matched_rows_and_charges_reads_sage_rows_of_confident_psms(tmp_path):
+    from searchops.cli.sage_score_mapper import matched_rows_and_charges
+
+    pd.DataFrame({
+        "psm_id": [1, 2, 3],
+        "scannr": ["precursor_idx=10", "precursor_idx=10", "precursor_idx=20"],
+        "charge": [3, 2, 2],
+    }).to_parquet(tmp_path / "psms.parquet", index=False)
+    pd.DataFrame({
+        "psm_id": [1, 1, 2, 3, 4],
+        "fragment_pmsms_row": [5, 7, 6, 40, 99],
+    }).to_csv(tmp_path / "fragments.tsv", sep="\t", index=False)
+
+    rows, charges = matched_rows_and_charges(tmp_path / "psms.parquet", tmp_path / "fragments.tsv")
+    assert rows.tolist() == [5, 7, 6, 40]  # psm 4 is not confident
+    assert charges.tolist() == [23, 23, 23, 2]

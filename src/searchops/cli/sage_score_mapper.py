@@ -389,16 +389,34 @@ def _chunked_2d_histogram(scores, intensities, threshold=None, bins_2d=BINS_2D):
     return hist, extent, finite_count, score_edges, int_edges
 
 
+def matched_rows_and_charges(confident_psms: str | Path, matched_fragments: str | Path):
+    """The pmsms rows of the confident PSMs' matched peaks (SAGE's `fragment_pmsms_row`)
+    and, per row, its precursor's detected charges as digits (e.g. 23 for charges 2 and 3)."""
+    psms = pd.read_parquet(confident_psms, columns=["psm_id", "scannr", "charge"])
+    precursor_idx = psms["scannr"].str.extract(r"precursor_idx=(\d+)", expand=False).astype(np.int64)
+    detected_charges = (
+        psms.assign(precursor_idx=precursor_idx)
+        .groupby("precursor_idx")["charge"]
+        .apply(lambda charges: int("".join(str(c) for c in sorted(set(charges)))))
+    )
+    fragments = pd.read_csv(matched_fragments, sep="\t", usecols=["psm_id", "fragment_pmsms_row"])
+    fragments = fragments[fragments["psm_id"].isin(psms["psm_id"])]
+    rows = fragments["fragment_pmsms_row"].to_numpy(np.int64)
+    if (rows < 0).any():
+        raise ValueError(f"{matched_fragments}: matched peaks without a pmsms row (-1); was SAGE given a pmsms?")
+    fragment_precursor = fragments["psm_id"].map(pd.Series(precursor_idx.to_numpy(), index=psms["psm_id"]))
+    return rows, detected_charges.reindex(fragment_precursor.to_numpy()).to_numpy()
+
+
 def main():
     p = argparse.ArgumentParser(
-        description="Map Sage scores against pmsms mapping results."
+        description="Compare pmsms scores of the peaks SAGE matched with all other peaks."
     )
-    p.add_argument("precursors", type=Path, help="Filtered precursors parquet.")
     p.add_argument("pmsms", type=Path, help="pmsms mmappet dataset directory.")
+    p.add_argument("confident_psms", type=Path, help="FDR-filtered PSMs parquet (sage-filter).")
     p.add_argument(
-        "mapped_precursors", type=Path, help="Mapping output precursors.parquet."
+        "matched_fragments", type=Path, help="SAGE matched_fragments.sage.tsv (with fragment_pmsms_row)."
     )
-    p.add_argument("mapping", type=Path, help="Mapping output mapping.parquet.")
     p.add_argument("--config", type=Path, required=True, help="Pipeline config TOML.")
     p.add_argument("-o", "--output", type=Path, required=True, help="Output directory.")
     args = p.parse_args()
@@ -421,10 +439,9 @@ if __name__ == "__main__":
     fasta = "human"
 
     __args = dict(
-        precursors=f"temp/{dataset}/{cfg}/filtered_precursor_clusters_with_nontrivial_ms2.mmappet",
         pmsms=f"temp/{dataset}/{cfg}/pmsms.mmappet",
-        mapped_precursors=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/sage_mapped_to_pmsms/precursors.parquet",
-        mapping=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/sage_mapped_to_pmsms/mapping.parquet",
+        confident_psms=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/results.sage.filtered.parquet",
+        matched_fragments=f"temp/{dataset}/{cfg}/sage/{sage_version}/{sage_cfg}/{fasta}/results/matched_fragments.sage.tsv",
         config=f"configs/{cfg}.toml",
         output=f"/home/matteo/temp/{dataset}_{cfg}_mappedback_scores",
     )
@@ -736,10 +753,9 @@ def _make_plots(
 
 
 def compare_scores(
-    precursors: str | Path,
     pmsms: str | Path,
-    mapped_precursors: str | Path,
-    mapping: str | Path,
+    confident_psms: str | Path,
+    matched_fragments: str | Path,
     config: str | Path,
     output: str | Path,
 ):
@@ -761,18 +777,11 @@ def compare_scores(
     pmsms_data = mmappet.open_dataset_dct(pmsms)
     pmsms_score = pmsms_data["score"]
     pmsms_intensity = pmsms_data["intensity"]
-    mapping_df = pd.read_parquet(mapping)
-    mapped_prec_df = pd.read_parquet(mapped_precursors)
+    matched_idx, charge_per_fragment = matched_rows_and_charges(confident_psms, matched_fragments)
 
     # ── 2. Extract pmsms scores / intensities for matched fragments ───────────
-    matched_idx = mapping_df["pmsms_fragment_idx"].to_numpy()
     matched_scores = pmsms_score[matched_idx]
     matched_intensity = pmsms_intensity[matched_idx]
-
-    charge_per_fragment = np.repeat(
-        mapped_prec_df["detected_charges"].to_numpy(),
-        mapped_prec_df["mapped_cnt"].to_numpy(),
-    )
 
     # ── 3. Build all plot tasks (all + q30 filter levels) ────────────────────
     tasks = _make_plots(

@@ -10,7 +10,6 @@ src/searchops/
     ├── sage_write.py        # sage-write    — export single-file summary TSV
     ├── sage_filter.py       # sage-filter   — FDR-filter TSV/parquet → parquet
     ├── sage_summarize_raw.py # sage-summarize-raw — filter+count raw SAGE results in one pass
-    ├── sage_pmsms_mapper.py # sage-pmsms-mapper — map fragments to mmappet library
     └── sage_score_mapper.py # sage_score_mapper — visualise pmsms score distributions
 ```
 
@@ -43,50 +42,27 @@ newlines. `quote='', ignore_errors=true` in `read_csv` handles this; the rows
 dropped by `ignore_errors` are the malformed ones (scannr only, not PSM data).
 Every reader of raw SAGE TSV output in this package applies the same handling.
 
-## `sage-pmsms-mapper` — fragment matching
+## `sage-pmsms-mapper` — removed (2026-10-06)
 
-Maps SAGE FDR-filtered PSMs and matched fragments to entries in a pmsms mmappet library.
-
-**Inputs**:
-- Filtered parquet (from `sage-filter`)
-- mmappet dataset directory (pmsms library m/z array)
-- Precursor slice parquet with `fragment_spectrum_start` and `fragment_event_cnt`
-
-**Outputs** (written to one output directory):
-- `precursors.parquet` — one row per matched precursor; detected/submitted charges + indices
-- `mapping.parquet` — one row per matched fragment (`pmsms_fragment_idx`, `sage_fragment_idx`)
-- `mz_delta_quantiles.parquet` — 101-point quantile distribution of m/z errors
-
-**Fragment m/z** (2026-10): with `--tof2mz <table>`, read from the pmsms' `tof`
-column as `float32(table[tof] / (1 + fragment_shift_ppm*1e-6))`, the shift from the
-precursors table when it has the column — SAGE's own arithmetic, so the m/z match what
-SAGE searched; without it, the `mz` column (necromerge2
-`plans/exports_from_tof2mz_table.md`). `_fragment_mz_source` / `_fragment_mz`.
-
-**Matching algorithm**: Numba-compiled two-pointer O(n+m) scan per precursor group.
-Experimental m/z values are sorted; library m/z is pre-sorted. Ties resolve to the
-lower-m/z library entry (pointer is **not** advanced on equality).
-
-**CSR indexing**: `timstofu.stats.get_index()` builds group-boundary arrays for parallel
-Numba dispatch.
-
-**Integrity checks** (fail loudly on pipeline breaks):
-- All found charge states must be in submitted charges (decimal-digit-encoded: `234` → charges 2, 3, 4)
-- All matched `precursor_idx` must exist in the submission parquet
-- Unsubmitted `precursor_idx` raise an error
-
-**Key dependencies**: `numba`, `timstofu`, mmappet dataset.
+It mapped SAGE's matched fragments back to pmsms rows by nearest m/z within 0.001 Da.
+SAGE now exports each matched peak's input row itself (`fragment_pmsms_row`,
+`closest_fragment_pmsms_row`; git/sage `docs/ai/pmsms_input.md`), exactly and in
+~0.35 s, so the mapper and its pipeline step `sage_map_to_pmsms` were removed. It also
+had a bug: it sorted each PSM's experimental m/z in place without their SAGE fragment
+indices, so on F9477 it found the right rows per precursor but attributed 89% of them
+to the wrong SAGE fragment (`mapping.parquet`'s `sage_fragment_idx`, which nothing read).
 
 ## `sage_score_mapper` — pmsms score visualisation
 
-Compares the `score` column of the pmsms mmappet library between fragments matched
-back by SAGE and all remaining (unmatched) fragments.
+Compares the `score` column of the pmsms mmappet library between peaks SAGE matched for
+confident PSMs and all remaining (unmatched) peaks.
 
 **Inputs**:
-- Filtered precursor candidates parquet
 - `pmsms.mmappet` directory (columns used: `score`, `intensity`)
-- `sage_mapped_to_pmsms/precursors.parquet` — CSR index (`mapped_idx`, `mapped_cnt`, `detected_charges`) from `sage-pmsms-mapper`
-- `sage_mapped_to_pmsms/mapping.parquet` — `pmsms_fragment_idx` per matched fragment
+- FDR-filtered PSMs parquet (`sage-filter`): which PSMs are confident, their charges
+- SAGE's `matched_fragments.sage.tsv`: `fragment_pmsms_row` of each matched peak
+  (`matched_rows_and_charges` takes the confident PSMs' rows, and per row its
+  precursor's detected charges as digits, e.g. `23`)
 - Pipeline config TOML — reads `pseudomsms.tofs_extraction_method` and `tofs_extraction_params` for plot titles
 
 **Outputs** (written to `--output` directory):
