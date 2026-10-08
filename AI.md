@@ -90,6 +90,11 @@ just by sitting at the same nesting level. `fragment_model`/`precursor_model`
 stay at the config root — only `tolerance_percentiles`/`tolerance_method` moved.
 Design/history: `plans/lda_external_rt_iim_features.md`.
 
+Sign: residuals are `observed − theoretical` (`precursor_ppm` is exp − calc;
+`fragment_ppm` likewise), and SAGE reads `precursor_tol`/`fragment_tol` the same
+way round (`git/sage/docs/ai/tolerance_convention.md`). Before 2026-10-08 SAGE
+mirrored the precursor window and the preliminary fragment window.
+
 `"theoretic"` (default) — `_symmetric_tolerance`, `median ± z·robust_sigma`
 (`z = norm.ppf(hi_pct/100)`), mirrors `feature_prediction.tolerance.
 symmetric_gaussian_tolerance` exactly (separate implementation, not a shared
