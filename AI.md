@@ -5,7 +5,12 @@
 ```
 src/searchops/
 ├── sage.py                  # summarize_sage() / count_sage() — core filtering & counting
+├── ion_level_fdr.py         # sage_ion_level_ids() / mokapot_ion_level_ids() — DIA-NN-style ion-level FDR
+├── fdr_levels.py            # sage_fdr_levels() / mokapot_fdr_levels() — spectra, peptidoforms, ions at one FDR
+├── run_db.py                # run database at $ION_MAIDEN_REGRESSION_DB
 └── cli/
+    ├── fdr_levels.py        # sage-fdr-levels / mokapot-fdr-levels — last step of the pipeline's run_sage / mokapot
+    ├── record_run.py        # record-run init|list|comment — manage the run database
     ├── sage_summary.py      # sage-summary  — compare results across folders
     ├── sage_write.py        # sage-write    — export single-file summary TSV
     ├── sage_filter.py       # sage-filter   — FDR-filter TSV/parquet → parquet
@@ -15,9 +20,21 @@ src/searchops/
 
 ## Core API (`sage.py`)
 
-Two exported functions:
+Exported functions:
 - `summarize_sage(path, fdr, level)` — filters by FDR on the fly; accepts TSV or parquet
-- `count_sage(path)` — counts a pre-filtered parquet (no FDR argument); used by `sage-summarize-raw`
+- `count_sage_at_fdr(path, fdr, level)` — filters raw SAGE results and counts in one pass; used by `sage-summarize-raw`. Counts rank-1 PSMs only (SAGE copies a peptide's q-value onto all its PSMs, so with `report_psms > 1` lower ranks would pass too)
+- `count_sage(path)` — counts a pre-filtered parquet (no FDR argument)
+
+Ion-level FDR (DIA-NN's definition: one score per `(peptide, charge)`, target-decoy
+competition at that level, peptides derived from the passing ions) has its own functions
+per programme in `ion_level_fdr.py`: `docs/ai/ion_level_fdr.md`, which also lists every
+counting definition in use and their F9477 numbers.
+
+The pipeline's results are three numbers per SAGE or mokapot node, each level at 1% FDR
+from its own competition: spectra, peptidoforms and ions (`fdr_levels.py`, written by
+`sage-fdr-levels`/`mokapot-fdr-levels` as the last step of the `run_sage`/`mokapot`
+commands). The same step records the run in the run database when
+`$ION_MAIDEN_REGRESSION_DB` is set: `docs/ai/run_db.md`.
 
 Filtering levels and their q-value columns:
 

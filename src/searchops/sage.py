@@ -66,6 +66,9 @@ def count_sage_at_fdr(
     in one pass, reading via pandas_ops.io.read_df (any format it supports, dispatched on
     file extension) rather than a hardcoded read_parquet/read_csv call.
 
+    Only rank-1 PSMs count: SAGE copies a peptide's q-value onto every PSM of it, so with
+    `report_psms > 1` lower-ranked PSMs of a confident peptide would pass too.
+
     Unlike summarize_sage(), this does not special-case malformed TSV rows (no
     ignore_errors/quote=''): SAGE's own TSV output is trusted to be well-formed here.
     """
@@ -74,7 +77,7 @@ def count_sage_at_fdr(
 
     con = duckdb.connect()
     con.register("sage_raw", df)
-    con.execute(f"CREATE VIEW sage AS SELECT * FROM sage_raw WHERE {q} <= {fdr} AND label = 1")
+    con.execute(f"CREATE VIEW sage AS SELECT * FROM sage_raw WHERE {q} <= {fdr} AND label = 1 AND rank = 1")
     psm_count = con.execute("SELECT COUNT(*) FROM sage").fetchone()[0]
     peptide_count = con.execute("SELECT COUNT(DISTINCT peptide) FROM sage").fetchone()[0]
     ion_count = con.execute(
